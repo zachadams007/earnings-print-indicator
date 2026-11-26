@@ -1,0 +1,2017 @@
+//@version=6
+indicator(
+     "Lane A Cockpit",
+     shorttitle="Lane A v62",
+     overlay=true,
+     max_labels_count=30,
+     max_lines_count=50,
+     max_boxes_count=24,
+     dynamic_requests=true,
+     calc_bars_count=20000
+)
+
+// Two separate systems live in this script, and they are deliberately kept apart.
+//
+// 1. The DIRECTIONAL SCORE (LONG 0-10 / SHORT 0-10) is chart-native. Every pane
+//    scores all three timeframes; what changes per pane is how loudly each one
+//    speaks. A 3m pane still feels a 30s reversal - enough to pull it off a clean
+//    10, never enough to flip it - so only genuine agreement across 3m, 1m and 30s
+//    earns 10 / 0. The 30s pane weights its own timeframe hardest, because that is
+//    the trade actually being taken, while the 3m rung still anchors it. Panes stay
+//    correlated because they run the same evidence families over shared rungs, and
+//    are free to differ because the weights differ.
+//
+//    The catch: a pane must request timeframes BELOW its own, and Bar Replay may
+//    refuse to serve those or return the last value it ever had. Every rung
+//    therefore carries its own close time and is rejected when stale, so a pane
+//    degrades to the rungs it can actually see and says which ones it lost.
+//
+// 2. The APB-1 MECHANICAL ENGINE still runs on standard 30-second OHLCV and owns
+//    the position geometry and the SETUP row only. It is a live-only tool by
+//    construction (Replay does not serve 30-second history) and it no longer feeds
+//    the score, the relative-volume readout, the structure levels, or AS OF.
+
+const string TZ = "America/New_York"
+const string RTH = "0930-1600"
+const string ENGINE_TF = "30S"
+const int MINUTE_MS = 60 * 1000
+const int ENTRY_WINDOW_MS = MINUTE_MS
+const int HOLD_WINDOW_MS = 15 * MINUTE_MS
+const int PULLBACK_WINDOW_MS = 6 * MINUTE_MS
+const int RESUMPTION_WINDOW_MS = 9 * MINUTE_MS
+const int RVOL_LOOKBACK = 20
+const int SLOTS_PER_RTH = 130
+const float RVOL_FLOOR = 1.5
+const float TARGET_1_R = 1.5
+const float TARGET_2_R = 2.0
+
+// Bound every requested dataset. The signal contexts retain 45 sessions, while
+// 3m RVOL receives another 25 sessions of warmup so incomplete and half-day
+// sessions can be discarded without starving ordinary history. The canonical
+// engine keeps 25 regular 30s sessions: enough sequential history for the full
+// RVOL ring while remaining below TradingView's 20,000 intraday-bar replay
+// ceiling. The outcome-only 1m boundary request needs just eight sessions.
+// Bar Replay moves the endpoint and rebuilds the same bounded windows.
+const int SIGNAL_SESSION_BUDGET = 45
+const int RVOL_SESSION_BUDGET = SIGNAL_SESSION_BUDGET + RVOL_LOOKBACK + 5
+const int ENGINE_REGULAR_SESSION_BUDGET = 25
+const int OUTCOME_BOUNDARY_SESSION_BUDGET = 8
+const int REGULAR_30S_BARS_PER_SESSION = 780
+const int ENGINE_CALC_BARS = ENGINE_REGULAR_SESSION_BUDGET * REGULAR_30S_BARS_PER_SESSION
+const int THREE_MINUTE_CALC_BARS = RVOL_SESSION_BUDGET * 130
+const int PEER_THREE_MINUTE_CALC_BARS = SIGNAL_SESSION_BUDGET * 130 + 100
+const int ONE_MINUTE_CALC_BARS = SIGNAL_SESSION_BUDGET * 390 + 100
+const int BOUNDARY_ONE_MINUTE_CALC_BARS = OUTCOME_BOUNDARY_SESSION_BUDGET * 960 + 100
+const int DAILY_CALC_BARS = SIGNAL_SESSION_BUDGET + 2
+const int DISPLAY_CALC_BARS = 5000
+// The score's own cross-timeframe rungs are short-history reads, not a 20-session
+// baseline, so they stay small enough to rebuild instantly at any Replay endpoint.
+const int SCORE_CONTEXT_CALC_BARS = 4000
+const int SCORE_PEER_CALC_BARS = 4000
+
+const int STATE_IDLE = 0
+const int STATE_ARMED = 1
+const int STATE_TRIGGERED = 2
+const int STATE_T1 = 3
+const int STATE_TARGET_2 = 4
+const int STATE_STOPPED = 5
+const int STATE_INVALIDATED = 6
+const int STATE_EXPIRED = 7
+const int STATE_TIME_EXIT = 8
+
+const int LEVEL_NONE = 0
+const int LEVEL_PDH = 1
+const int LEVEL_PDL = 2
+const int LEVEL_PDC = 3
+const int LEVEL_ORH = 6
+const int LEVEL_ORL = 7
+
+const string G_DISPLAY = "Display"
+const string G_SUPERTREND = "Supertrend (score input)"
+const string G_SCORE = "Directional score"
+const string G_LADDER = "Directional score — timeframe ladder"
+const string G_EXTERNAL = "Read my own on-chart indicators"
+const string G_RVOL = "Relative volume"
+
+bool showTarget1 = input.bool(true, "Show TP1 divider", group=G_DISPLAY)
+bool showStructure = input.bool(true, "Show nearest support and resistance on 3m", group=G_DISPLAY)
+bool showPlanOnContext = input.bool(true, "Show lighter position zones on 3m and 1m", group=G_DISPLAY)
+int completedTradesToKeep = input.int(5, "Completed position visuals to keep", minval=1, maxval=10, group=G_DISPLAY)
+bool showDemoPosition = input.bool(false, "Show DEMO sample position (not a real trade)", group=G_DISPLAY)
+// Heikin-Ashi look WITHOUT the Heikin-Ashi chart type. Bar Replay refuses to serve
+// a different ticker at the chart's own timeframe, so an actual Heikin-Ashi 30s
+// chart can never obtain its own standard-price 30-second data in Replay - its rung
+// and its VWAP silently drift from every other pane. But Heikin-Ashi is only a
+// transform of standard OHLC, so the candles can be drawn here from this chart's own
+// bars, with no request at all. Keep the chart on standard candles, switch this on,
+// and hide the real candles in Chart settings → Symbol (uncheck Body, Borders,
+// Wick). Same visual tempo, correct data underneath.
+bool showHeikinAshi = input.bool(false, "Draw Heikin-Ashi candles (hide the real candles in Chart settings)", group=G_DISPLAY)
+
+// Supertrend is one soft evidence family in the directional score, never a hard gate.
+float stFactor3 = input.float(2.0, "3m Supertrend ATR factor", minval=0.5, step=0.1, group=G_SUPERTREND)
+int stLength3 = input.int(10, "3m Supertrend ATR length", minval=1, group=G_SUPERTREND)
+float stFactor1 = input.float(3.0, "1m Supertrend ATR factor", minval=0.5, step=0.1, group=G_SUPERTREND)
+int stLength1 = input.int(10, "1m Supertrend ATR length", minval=1, group=G_SUPERTREND)
+float stFactor30 = input.float(3.0, "30s Supertrend ATR factor", minval=0.5, step=0.1, group=G_SUPERTREND)
+int stLength30 = input.int(10, "30s Supertrend ATR length", minval=1, group=G_SUPERTREND)
+
+// Evidence families. Each family casts at most one vote per side per timeframe and
+// declares whether it had data at all, so a family that cannot report renormalises
+// away instead of silently counting as disagreement.
+int dmiLength = input.int(14, "DMI length", minval=2, group=G_SCORE)
+int adxSmoothing = input.int(14, "ADX smoothing", minval=1, group=G_SCORE)
+float adxTrendFloor = input.float(20.0, "ADX floor — below this the DMI family reads chop", minval=0.0, step=1.0, group=G_SCORE)
+int structLen = input.int(20, "Structure lookback (bars)", minval=3, group=G_SCORE)
+int oscLen = input.int(9, "Momentum lookback (bars)", minval=2, group=G_SCORE)
+int oscRankLen = input.int(60, "Oscillator range lookback (bars)", minval=10, group=G_SCORE)
+float scoreRvolFloor = input.float(1.5, "Participation threshold used by the score", minval=1.0, step=0.1, group=G_SCORE)
+float chaseAtrMult = input.float(2.0, "Anti-chase: extension beyond EMA9, in ATRs", minval=0.5, step=0.1, group=G_SCORE)
+bool showDrivers = input.bool(true, "Show the score drivers row", group=G_SCORE)
+
+// Exhaustion/washout veto (round-3 research fix - see research/lane_a_score/score_engine.py
+// `_exhaustion_votes` / exhaustion_mode="veto" and docs/LANE-A-SCORE-ITERATION-2026-07-25.md
+// PART 3). The score is a pure continuation model, so on a washed-out bar it kept voting
+// SHORT into what was actually a bounce ([n]% of RSI-oversold bars). This is NOT a 6th vote -
+// it VETOES the opposing continuation families' vote at an exhaustion extreme, which cut that
+// false-vote rate to [n]% and modestly improved the top score bucket's forward return. `add`
+// and `invert` modes were both tested and both made things worse; only `veto` is ported here.
+bool useExhaustionVeto = input.bool(true, "Stop the score voting against a washout", group=G_SCORE)
+int exhRsiLen = input.int(14, "Exhaustion: RSI length", minval=2, group=G_SCORE)
+float exhRsiThreshold = input.float(25.0, "Exhaustion: RSI oversold / overbought threshold", minval=1.0, maxval=49.0, step=1.0, group=G_SCORE)
+float exhAtrExtension = input.float(1.5, "Exhaustion: distance from session VWAP, in ATRs", minval=0.1, step=0.1, group=G_SCORE)
+int exhConsecBars = input.int(3, "Exhaustion: consecutive down/up closes required", minval=1, group=G_SCORE)
+float exhRvolMult = input.float(1.5, "Exhaustion: volume spike threshold (x average volume)", minval=1.0, step=0.1, group=G_SCORE)
+int exhMinVotes = input.int(3, "Exhaustion: sub-conditions required (of 5)", minval=1, maxval=5, group=G_SCORE)
+int exhAtrLen = input.int(14, "Exhaustion: ATR length", minval=1, group=G_SCORE)
+
+// Every pane sees all three timeframes; what changes is how loudly each one
+// speaks. A 3m pane still hears a 30s reversal - it just is not allowed to be
+// overruled by it - so a fully-short 30s rung pulls the 3m pane off a perfect 10
+// without flipping it. Only genuine agreement across all three earns 10 / 0.
+// Conversely the 30s pane weights its own timeframe hardest, because a short
+// signal there is the actual trade being taken, while the 3m still anchors it.
+// Weights are renormalised over whatever rungs actually reported, so a rung that
+// Bar Replay cannot serve shifts its weight instead of scoring as disagreement.
+float weight3mPaneOn3m = input.float(0.70, "3m pane — weight on 3m", minval=0.0, maxval=1.0, step=0.05, group=G_LADDER)
+float weight3mPaneOn1m = input.float(0.20, "3m pane — weight on 1m", minval=0.0, maxval=1.0, step=0.05, group=G_LADDER)
+float weight3mPaneOn30s = input.float(0.10, "3m pane — weight on 30s", minval=0.0, maxval=1.0, step=0.05, group=G_LADDER)
+float weight1mPaneOn3m = input.float(0.35, "1m pane — weight on 3m", minval=0.0, maxval=1.0, step=0.05, group=G_LADDER)
+float weight1mPaneOn1m = input.float(0.45, "1m pane — weight on 1m", minval=0.0, maxval=1.0, step=0.05, group=G_LADDER)
+float weight1mPaneOn30s = input.float(0.20, "1m pane — weight on 30s", minval=0.0, maxval=1.0, step=0.05, group=G_LADDER)
+float weight30sPaneOn3m = input.float(0.30, "30s pane — weight on 3m", minval=0.0, maxval=1.0, step=0.05, group=G_LADDER)
+float weight30sPaneOn1m = input.float(0.25, "30s pane — weight on 1m", minval=0.0, maxval=1.0, step=0.05, group=G_LADDER)
+float weight30sPaneOn30s = input.float(0.45, "30s pane — weight on 30s", minval=0.0, maxval=1.0, step=0.05, group=G_LADDER)
+float peerWeight = input.float(0.10, "Weight on SPY / QQQ / IWM breadth", minval=0.0, maxval=0.5, step=0.05, group=G_LADDER)
+// When the two fast timeframes agree with each other AND against the 3m, that is a
+// counter-trend scalp setup rather than noise. It is more tradeable the faster the
+// chart, because the position is held for less time and the 3m trend has less
+// opportunity to reassert before the move is done - so the 30s pane leans further
+// into it than the 1m pane does. Expressed in score points, applied to the fast
+// side and taken off the opposing side.
+float scalpEdge30sPane = input.float(0.5, "30s pane — bonus points when 1m + 30s agree against the 3m", minval=0.0, maxval=3.0, step=0.1, group=G_LADDER)
+float scalpEdge1mPane = input.float(0.0, "1m pane — same bonus", minval=0.0, maxval=3.0, step=0.1, group=G_LADDER)
+// A rung is ignored when its own close time has fallen this far behind the chart.
+float staleRungMultiple = input.float(2.0, "Reject a rung staler than this × (its own + this chart's) bar length", minval=1.0, step=0.5, group=G_LADDER)
+
+// Point these at the studies already on the pane so the score reads exactly what
+// you see rather than an approximation of it. They are OFF by default so a fresh
+// paste can never invent a signal out of the default `close` source, and the HUD
+// says plainly when a toggle is on but no plot has been chosen yet. Because Pine
+// cannot carry another indicator's output into a request for a different
+// timeframe, a wired study applies to this pane's OWN timeframe; the higher rungs
+// of the ladder keep using the internal recomputation.
+bool useMyBoom = input.bool(false, "Use my Boom Hunter Pro", group=G_EXTERNAL)
+float myBoomSource = input.source(close, "Boom Hunter oscillator plot", group=G_EXTERNAL)
+bool useMySupertrend = input.bool(false, "Use my Supertrend", group=G_EXTERNAL)
+float mySupertrendSource = input.source(close, "Supertrend line plot", group=G_EXTERNAL)
+bool useMyDmi = input.bool(false, "Use my DMI", group=G_EXTERNAL)
+float myDiPlusSource = input.source(close, "DI+ plot", group=G_EXTERNAL)
+float myDiMinusSource = input.source(close, "DI− plot", group=G_EXTERNAL)
+float myAdxSource = input.source(close, "ADX plot", group=G_EXTERNAL)
+
+// Relative-volume participation. One definition feeds both the dots below the bars
+// and the score's participation family, so the number in the HUD and the dots on
+// the chart can never disagree. It is computed on this pane's own bars, which is
+// why it kept working in Replay when the old engine-sourced number did not.
+bool showRvolMarks = input.bool(true, "Show relative-volume participation dots", group=G_RVOL)
+float rvolMarkFloor = input.float(1.5, "Participation threshold (x average volume)", minval=1.0, step=0.1, group=G_RVOL)
+int rvolMarkLen = input.int(20, "Average length in bars", minval=5, group=G_RVOL)
+bool rvolFirstOnly = input.bool(true, "Only mark the first bar of each surge", group=G_RVOL)
+
+string standardTicker = ticker.standard(ticker.new(syminfo.prefix, syminfo.ticker, session.regular))
+// The canonical engine runs only on regular-session standard prices. This keeps
+// Bar Replay inside TradingView's intraday history ceiling. A small, isolated
+// extended 1m request remains outcome-only; no pre/post-market price can enter
+// setup, entry, stop, target, EMA, VWAP, or RVOL logic.
+string engineTicker = ticker.new(syminfo.prefix, syminfo.ticker, session.regular)
+bool isThreeMinute = timeframe.isminutes and timeframe.multiplier == 3
+bool isOneMinute = timeframe.isminutes and timeframe.multiplier == 1
+bool isThirtySecond = timeframe.isseconds and timeframe.multiplier == 30
+bool isSupportedSymbol = syminfo.ticker == "SPY" or syminfo.ticker == "QQQ" or syminfo.ticker == "IWM"
+bool isSupportedTimeframe = isThreeMinute or isOneMinute or isThirtySecond
+// The 30s pane accepts EITHER candle style, and the choice has a real consequence.
+// Bar Replay will not serve a request for the chart's own timeframe - not directly
+// and not relayed through a higher one - so on a Heikin-Ashi 30s pane the only
+// 30-second data obtainable is the Heikin-Ashi candles themselves. That makes its
+// 30s rung disagree with the 3m pane's standard-priced one, and leaves the session
+// VWAP on Heikin-Ashi prices. On STANDARD candles the pane's own bars already are
+// standard, so the rung matches every other pane and the VWAP is the real one.
+// Heikin-Ashi remains available for visual tempo; the HUD says when it is costing
+// accuracy rather than hiding it.
+bool chartStyleMatches = ((isThreeMinute or isOneMinute) and chart.is_standard) or (isThirtySecond and (chart.is_heikinashi or chart.is_standard))
+bool displayContractMatches = isSupportedSymbol and isSupportedTimeframe and chartStyleMatches
+string paneName = isThreeMinute ? "3m CONTEXT" : isOneMinute ? "1m CONFIRM" : isThirtySecond ? "30s EXECUTION" : "UNSUPPORTED"
+
+f_session_vwap() =>
+    // Exchange-defined market hours handle early closes correctly. The daily
+    // boundary is also required on a regular-only ticker, where yesterday's
+    // final available bar is adjacent to today's 09:30 bar.
+    bool inRth = session.ismarket
+    bool newRth = inRth and (timeframe.change("1D") or not session.ismarket[1])
+    [vwapValue, upperTwo, lowerTwo] = ta.vwap(hlc3, newRth, 2.0)
+    [inRth ? vwapValue : na, inRth ? upperTwo : na, inRth ? lowerTwo : na]
+
+// The evidence families, each split out so a rung can have one family swapped for
+// the equivalent study already on the chart without disturbing the others. Every
+// rung runs the identical set, which is what keeps the panes correlated: they are
+// not three different scores, they are one score read at three speeds. Votes are
+// soft and additive and no family can veto another. Each returns [long, short,
+// available] where `available` is 0 when the family had no data to judge - that
+// renormalises the family away instead of counting it as disagreement.
+
+// Trend: where price sits against the session VWAP, and which way the EMA9 is
+// sloping. Both must agree, so drift alongside VWAP scores nothing.
+f_vote_trend(float px, float emaNow, float emaPrev, float vwapValue) =>
+    int lng = 0
+    int sht = 0
+    int avail = 0
+    if not na(px) and not na(vwapValue) and not na(emaNow) and not na(emaPrev)
+        avail := 1
+        if px > vwapValue and emaNow > emaPrev
+            lng := 1
+        else if px < vwapValue and emaNow < emaPrev
+            sht := 1
+    [lng, sht, avail]
+
+// Supertrend regime. Direction is -1 in an uptrend and +1 in a downtrend, matching
+// ta.supertrend, so a wired study must be converted to that convention first.
+f_vote_supertrend(float stDirection) =>
+    int lng = 0
+    int sht = 0
+    int avail = 0
+    if not na(stDirection)
+        avail := 1
+        if stDirection < 0
+            lng := 1
+        else if stDirection > 0
+            sht := 1
+    [lng, sht, avail]
+
+// Directional dominance, but only when ADX says a trend actually exists. Below the
+// floor the family reports "present but neutral" rather than pretending.
+f_vote_dmi(float diPlus, float diMinus, float adxValue) =>
+    int lng = 0
+    int sht = 0
+    int avail = 0
+    if not na(diPlus) and not na(diMinus) and not na(adxValue)
+        avail := 1
+        if adxValue >= adxTrendFloor
+            if diPlus > diMinus
+                lng := 1
+            else if diMinus > diPlus
+                sht := 1
+    [lng, sht, avail]
+
+// Oscillator level and slope, two separate votes. Level is read as a percentile of
+// the oscillator's OWN recent range, so any indicator's scale works untouched.
+f_vote_oscillator(float oscRank, float oscNow, float oscPrev) =>
+    int lng = 0
+    int sht = 0
+    int avail = 0
+    if not na(oscRank)
+        avail := avail + 1
+        if oscRank >= 60
+            lng := lng + 1
+        else if oscRank <= 40
+            sht := sht + 1
+    if not na(oscNow) and not na(oscPrev)
+        avail := avail + 1
+        if oscNow > oscPrev
+            lng := lng + 1
+        else if oscNow < oscPrev
+            sht := sht + 1
+    [lng, sht, avail]
+
+// Structure: a break of the recent swing range in either direction.
+f_vote_structure(float px, bool brokeUp, bool brokeDown) =>
+    int lng = 0
+    int sht = 0
+    int avail = 0
+    if not na(px)
+        avail := 1
+        if brokeUp
+            lng := 1
+        else if brokeDown
+            sht := 1
+    [lng, sht, avail]
+
+// Exhaustion/washout state, mirroring research/lane_a_score/score_engine.py's
+// `_exhaustion_votes` exactly. "Long exhaustion" (washed-out, likely to bounce) fires when
+// exhMinVotes-of-5 conditions agree: RSI oversold, close in the upper 40% of its own bar's
+// range (absorption, not a plain closing low), price >= exhAtrExtension ATRs BELOW session
+// VWAP, >= exhConsecBars consecutive down closes, and an RVOL spike on a down bar. "Short
+// exhaustion" (blow-off top) mirrors every condition. Reads close/high/low directly off the
+// calling context (own bars when called natively, the requested rung's bars when called
+// from inside f_tf_score), exactly like the family-vote helpers above.
+f_exhaustion_state(float vwapValue, float rvolRatio) =>
+    float rsiValue = ta.rsi(close, exhRsiLen)
+    float atrValue = ta.atr(exhAtrLen)
+    float barRange = high - low
+    float closePos = barRange > 0 ? (close - low) / barRange : na
+    float ext = not na(atrValue) and atrValue > 0 and not na(vwapValue) ? (close - vwapValue) / atrValue : na
+    bool downBar = close < close[1]
+    bool upBar = close > close[1]
+    float consecDown = nz(ta.barssince(close >= close[1]))
+    float consecUp = nz(ta.barssince(close <= close[1]))
+    bool volSpikeDown = not na(rvolRatio) and rvolRatio >= exhRvolMult and downBar
+    bool volSpikeUp = not na(rvolRatio) and rvolRatio >= exhRvolMult and upBar
+    int longVotes = (not na(rsiValue) and rsiValue <= exhRsiThreshold ? 1 : 0) + (not na(closePos) and closePos >= 0.6 ? 1 : 0) + (not na(ext) and ext <= -exhAtrExtension ? 1 : 0) + (consecDown >= exhConsecBars ? 1 : 0) + (volSpikeDown ? 1 : 0)
+    int shortVotes = (not na(rsiValue) and rsiValue >= (100.0 - exhRsiThreshold) ? 1 : 0) + (not na(closePos) and closePos <= 0.4 ? 1 : 0) + (not na(ext) and ext >= exhAtrExtension ? 1 : 0) + (consecUp >= exhConsecBars ? 1 : 0) + (volSpikeUp ? 1 : 0)
+    bool exhLong = longVotes >= exhMinVotes
+    bool exhShort = shortVotes >= exhMinVotes
+    [exhLong, exhShort]
+
+// Sum the families into one rung, then let participation reinforce whichever side
+// already leads. Participation is deliberately last and never creates a direction
+// on its own, which is why it cannot live inside the family helpers.
+f_assemble_rung(
+     int trendLong, int trendShort, int trendAvail,
+     int stLong, int stShort, int stAvail,
+     int dmiLong, int dmiShort, int dmiAvail,
+     int oscLong, int oscShort, int oscAvail,
+     int structLong, int structShort, int structAvail,
+     float rvolRatio
+) =>
+    int lng = trendLong + stLong + dmiLong + oscLong + structLong
+    int sht = trendShort + stShort + dmiShort + oscShort + structShort
+    int avail = trendAvail + stAvail + dmiAvail + oscAvail + structAvail
+    if not na(rvolRatio)
+        avail := avail + 1
+        if rvolRatio >= scoreRvolFloor
+            if lng > sht
+                lng := lng + 1
+            else if sht > lng
+                sht := sht + 1
+    [lng, sht, avail]
+
+// One rung of the ladder, computed entirely inside its own timeframe's context.
+// Used only for timeframes HIGHER than the chart, which is why it is safe in Bar
+// Replay and why it recomputes everything internally: another indicator's plot
+// cannot be carried into a request for a different timeframe.
+f_tf_score(float stFactor, int stLength) =>
+    [vwapValue, _upperTwo, _lowerTwo] = f_session_vwap()
+    float emaNow = ta.ema(close, 9)
+    [_stValue, stDirection] = ta.supertrend(stFactor, stLength)
+    [diPlus, diMinus, adxValue] = ta.dmi(dmiLength, adxSmoothing)
+    float osc = ta.roc(close, oscLen)
+    float oscRank = ta.percentrank(osc, oscRankLen)
+    float rvolBaseline = ta.sma(volume[1], rvolMarkLen)
+    float rvolRatio = not na(rvolBaseline) and rvolBaseline > 0 ? volume / rvolBaseline : na
+    float swingHigh = ta.highest(high[1], structLen)
+    float swingLow = ta.lowest(low[1], structLen)
+    [trendLong, trendShort, trendAvail] = f_vote_trend(close, emaNow, emaNow[1], vwapValue)
+    [stLong, stShort, stAvail] = f_vote_supertrend(stDirection)
+    [dmiLong, dmiShort, dmiAvail] = f_vote_dmi(diPlus, diMinus, adxValue)
+    [oscLong, oscShort, oscAvail] = f_vote_oscillator(oscRank, osc, osc[1])
+    [structLong, structShort, structAvail] = f_vote_structure(close, not na(swingHigh) and close > swingHigh, not na(swingLow) and close < swingLow)
+    // Exhaustion veto: a washed-out bar no longer gets to vote SHORT into its own bounce,
+    // and a blown-off bar no longer gets to vote LONG into its own rollover. `available` is
+    // untouched on every family, so the denominator and the renormalisation are unaffected -
+    // this only removes votes, it never adds one or inverts a direction.
+    if useExhaustionVeto
+        [exhLong, exhShort] = f_exhaustion_state(vwapValue, rvolRatio)
+        if exhLong
+            trendShort := 0
+            stShort := 0
+            dmiShort := 0
+            oscShort := 0
+            structShort := 0
+        if exhShort
+            trendLong := 0
+            stLong := 0
+            dmiLong := 0
+            oscLong := 0
+            structLong := 0
+    // The families come back SEPARATED rather than pre-summed, so the pane that owns
+    // this timeframe can swap in the real study from its chart for one family
+    // without disturbing the rest. time_close travels along so the caller can reject
+    // a stale answer: a request Bar Replay cannot serve may hand back the last value
+    // it ever had, and a rung frozen at 09:33 while the cursor sits at 10:24 is far
+    // more dangerous than a rung that admits it has nothing.
+    [trendLong, trendShort, trendAvail, stLong, stShort, stAvail, dmiLong, dmiShort, dmiAvail, oscLong, oscShort, oscAvail, structLong, structShort, structAvail, rvolRatio, time_close]
+
+// Bar Replay does not serve a request for the chart's OWN timeframe - higher and
+// lower are both fine, same-timeframe comes back empty. On the Heikin-Ashi 30s pane
+// that would drop the 30s rung back to Heikin-Ashi candles, so "30s" would mean
+// something different there than it does on the 3m pane. Routing the identical
+// 30-second request through a 1-minute context turns it into a LOWER-timeframe
+// request, which Replay does serve, so the rung stays standard-priced everywhere.
+f_thirty_second_rung() =>
+    request.security(standardTicker, "30S", f_tf_score(stFactor30, stLength30), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=SCORE_CONTEXT_CALC_BARS)
+
+f_thirty_second_vwap() =>
+    request.security(standardTicker, "30S", f_session_vwap(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=DISPLAY_CALC_BARS)
+
+// Cross-index breadth. Read at 3m from every pane, which is the chart timeframe or
+// higher in all three supported cases.
+f_peer_direction() =>
+    [vwapValue, _upperTwo, _lowerTwo] = f_session_vwap()
+    float emaNow = ta.ema(close, 9)
+    not na(vwapValue) and not na(emaNow) and not na(emaNow[1]) ? (close > vwapValue and emaNow > emaNow[1] ? 1 : close < vwapValue and emaNow < emaNow[1] ? -1 : 0) : na
+
+// Return raw completed regular-session 3m values only. Same-clock Relative
+// Volume is stateful and therefore lives in the enclosing canonical engine,
+// not in this nested requested context.
+f_three_minute_context() =>
+    [vwapValue, upperTwo, lowerTwo] = f_session_vwap()
+    float ema9Value = ta.ema(close, 9)
+    [time[1], time_close[1], open[1], high[1], low[1], close[1], close[2], volume[1], ema9Value[1], ema9Value[2], vwapValue[1], upperTwo[1], lowerTwo[1]]
+
+f_peer_bias() =>
+    [vwapValue, _upperTwo, _lowerTwo] = f_session_vwap()
+    float ema9Value = ta.ema(close, 9)
+    close[1] > vwapValue[1] and ema9Value[1] > ema9Value[2] ? 1 : close[1] < vwapValue[1] and ema9Value[1] < ema9Value[2] ? -1 : 0
+
+f_one_minute_context() =>
+    [vwapValue, _upperTwo, _lowerTwo] = f_session_vwap()
+    float ema9Value = ta.ema(close, 9)
+    [time[1], time_close[1], open[1], high[1], low[1], close[1], high[2], low[2], ema9Value[1], ema9Value[2], vwapValue[1]]
+
+// The boundary-session 1m series is an outcome clock only. It deliberately
+// carries no EMA/VWAP signal inputs, so post-market prices cannot affect APB-1.
+f_one_minute_outcome() =>
+    bool completedWasRth = session.ismarket[1]
+    // On the first post-RTH minute, the immediately preceding 1m bar
+    // is the completed final regular minute, including exchange half-days.
+    bool completedWasLastRth = completedWasRth and not session.ismarket
+    [time[1], time_close[1], high[1], low[1], completedWasRth, completedWasLastRth]
+
+f_nearest_levels(
+     float price,
+     float priorHigh,
+     float priorLow,
+     float priorClose,
+     float openingHigh,
+     float openingLow
+) =>
+    float support = na
+    int supportCode = LEVEL_NONE
+    float resistance = na
+    int resistanceCode = LEVEL_NONE
+    if not na(priorHigh)
+        if priorHigh <= price and (na(support) or priorHigh > support)
+            support := priorHigh
+            supportCode := LEVEL_PDH
+        if priorHigh >= price and (na(resistance) or priorHigh < resistance)
+            resistance := priorHigh
+            resistanceCode := LEVEL_PDH
+    if not na(priorLow)
+        if priorLow <= price and (na(support) or priorLow > support)
+            support := priorLow
+            supportCode := LEVEL_PDL
+        if priorLow >= price and (na(resistance) or priorLow < resistance)
+            resistance := priorLow
+            resistanceCode := LEVEL_PDL
+    if not na(priorClose)
+        if priorClose <= price and (na(support) or priorClose > support)
+            support := priorClose
+            supportCode := LEVEL_PDC
+        if priorClose >= price and (na(resistance) or priorClose < resistance)
+            resistance := priorClose
+            resistanceCode := LEVEL_PDC
+    if not na(openingHigh)
+        if openingHigh <= price and (na(support) or openingHigh > support)
+            support := openingHigh
+            supportCode := LEVEL_ORH
+        if openingHigh >= price and (na(resistance) or openingHigh < resistance)
+            resistance := openingHigh
+            resistanceCode := LEVEL_ORH
+    if not na(openingLow)
+        if openingLow <= price and (na(support) or openingLow > support)
+            support := openingLow
+            supportCode := LEVEL_ORL
+        if openingLow >= price and (na(resistance) or openingLow < resistance)
+            resistance := openingLow
+            resistanceCode := LEVEL_ORL
+    [support, supportCode, resistance, resistanceCode]
+
+f_canonical_engine() =>
+    string regularTicker = ticker.new(syminfo.prefix, syminfo.ticker, session.regular)
+    string boundaryTicker = ticker.new(syminfo.prefix, syminfo.ticker, session.extended)
+    [ctx3Time, ctx3CloseTime, ctx3Open, ctx3High, ctx3Low, ctx3Close, ctx3PreviousClose, ctx3Volume, ctx3Ema9, ctx3PreviousEma9, ctx3Vwap, ctx3UpperTwo, ctx3LowerTwo] = request.security(
+         regularTicker,
+         "3",
+         f_three_minute_context(),
+         gaps=barmerge.gaps_off,
+         lookahead=barmerge.lookahead_on,
+         calc_bars_count=THREE_MINUTE_CALC_BARS
+    )
+    [ctx1Time, ctx1CloseTime, ctx1Open, ctx1High, ctx1Low, ctx1Close, ctx1PreviousHigh, ctx1PreviousLow, ctx1Ema9, ctx1PreviousEma9, ctx1Vwap] = request.security(
+         regularTicker,
+         "1",
+         f_one_minute_context(),
+         gaps=barmerge.gaps_off,
+         lookahead=barmerge.lookahead_on,
+         calc_bars_count=ONE_MINUTE_CALC_BARS
+    )
+    [outcome1Time, outcome1CloseTime, outcome1High, outcome1Low, outcome1WasRth, outcome1IsLastRegular] = request.security(
+         boundaryTicker,
+         "1",
+         f_one_minute_outcome(),
+         gaps=barmerge.gaps_off,
+         lookahead=barmerge.lookahead_on,
+         calc_bars_count=BOUNDARY_ONE_MINUTE_CALC_BARS
+    )
+    string spyTicker = ticker.new("AMEX", "SPY", session.regular)
+    string qqqTicker = ticker.new("NASDAQ", "QQQ", session.regular)
+    string iwmTicker = ticker.new("AMEX", "IWM", session.regular)
+    int spyBias = request.security(spyTicker, "3", f_peer_bias(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, calc_bars_count=PEER_THREE_MINUTE_CALC_BARS)
+    int qqqBias = request.security(qqqTicker, "3", f_peer_bias(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, calc_bars_count=PEER_THREE_MINUTE_CALC_BARS)
+    int iwmBias = request.security(iwmTicker, "3", f_peer_bias(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, calc_bars_count=PEER_THREE_MINUTE_CALC_BARS)
+
+    bool inRth = session.ismarket
+    bool previousInRth = session.ismarket[1]
+    bool startsRth = inRth and (timeframe.change("1D") or not previousInRth)
+    // Do not close a live plan at the opening tick of the final 30s bar. The
+    // final-minute boundary runs separately after the bar's scheduled close.
+    bool sessionBoundaryReady = session.islastbar_regular and timenow >= time_close
+    int sourceTime = time
+    int sourceCloseTime = time_close
+    float sourceOpen = open
+    float sourceHigh = high
+    float sourceLow = low
+
+    var int lastProcessedSourceTime = na
+    var int lastProcessed3mTime = na
+    var int lastRvol3mTime = na
+    var int lastProcessed1mTime = na
+    var int lastOutcome1mTime = na
+    var int lastSessionBoundaryCloseTime = na
+    var float openingHigh = na
+    var float openingLow = na
+    var bool openingLocked = false
+    var int setupStage = 0
+    var bool sessionFinished = false
+    var int breakoutSide = 0
+    var int breakoutTime = na
+    var float breakoutVolume = na
+    var float breakoutRvol = na
+    var float pullbackStop = na
+    var int pullbackTime = na
+
+    var int planId = 0
+    var int lifecycle = STATE_IDLE
+    var int planSide = 0
+    var int signalTime = na
+    var int entryDeadline = na
+    var int entryTime = na
+    var int holdDeadline = na
+    var int terminalTime = na
+    var float entryPrice = na
+    var float stopPrice = na
+    var float target1Price = na
+    var float target2Price = na
+    var bool target1Hit = false
+    var int lastRthAsOf = na
+
+    // Same-clock RVOL ring. It persists in the canonical 30s engine, where
+    // mutable state advances once per observed completed 3m bar. Only complete
+    // 130-slot sessions enter the eligible history. Ingestion is deliberately
+    // separate from current-day strategy logic: yesterday's 15:57 slot first
+    // becomes visible at today's 09:30 boundary.
+    var array<float> eligibleVolumes = array.new_float(RVOL_LOOKBACK * SLOTS_PER_RTH, na)
+    var array<float> currentVolumes = array.new_float(SLOTS_PER_RTH, na)
+    var array<float> priorVolumes = array.new_float(RVOL_LOOKBACK, na)
+    var int rvolCurrentDateKey = na
+    var int rvolCurrentSlotCount = 0
+    var int eligibleWriteIndex = 0
+    var float ctx3Rvol = na
+    var int ctx3PriorSessions = 0
+
+    bool previousBarWasRth = session.ismarket[1]
+    if previousBarWasRth
+        lastRthAsOf := time_close[1]
+    int engineAsOf = lastRthAsOf
+    int bias3 = not na(ctx3Close) and not na(ctx3Vwap) and not na(ctx3Ema9) and not na(ctx3PreviousEma9) ? (ctx3Close > ctx3Vwap and ctx3Ema9 > ctx3PreviousEma9 ? 1 : ctx3Close < ctx3Vwap and ctx3Ema9 < ctx3PreviousEma9 ? -1 : 0) : 0
+    int longPeerCount = (spyBias == 1 ? 1 : 0) + (qqqBias == 1 ? 1 : 0) + (iwmBias == 1 ? 1 : 0)
+    int shortPeerCount = (spyBias == -1 ? 1 : 0) + (qqqBias == -1 ? 1 : 0) + (iwmBias == -1 ? 1 : 0)
+
+    if not na(sourceTime) and (na(lastProcessedSourceTime) or sourceTime != lastProcessedSourceTime)
+        lastProcessedSourceTime := sourceTime
+
+        if not na(ctx3Time) and (na(lastRvol3mTime) or ctx3Time != lastRvol3mTime)
+            lastRvol3mTime := ctx3Time
+            int rvolDateKey = year(ctx3Time, TZ) * 10000 + month(ctx3Time, TZ) * 100 + dayofmonth(ctx3Time, TZ)
+            int rvolClockMinutes = hour(ctx3Time, TZ) * 60 + minute(ctx3Time, TZ)
+            int rvolSlot = int(math.floor((rvolClockMinutes - 570) / 3))
+            if rvolSlot >= 0 and rvolSlot < SLOTS_PER_RTH
+                if na(rvolCurrentDateKey)
+                    rvolCurrentDateKey := rvolDateKey
+                else if rvolDateKey != rvolCurrentDateKey
+                    if rvolCurrentSlotCount == SLOTS_PER_RTH
+                        for slot = 0 to SLOTS_PER_RTH - 1
+                            array.set(eligibleVolumes, eligibleWriteIndex * SLOTS_PER_RTH + slot, array.get(currentVolumes, slot))
+                        eligibleWriteIndex := (eligibleWriteIndex + 1) % RVOL_LOOKBACK
+                    array.fill(currentVolumes, na)
+                    rvolCurrentSlotCount := 0
+                    rvolCurrentDateKey := rvolDateKey
+
+                ctx3PriorSessions := 0
+                for sessionOffset = 0 to RVOL_LOOKBACK - 1
+                    float historicalVolume = array.get(eligibleVolumes, sessionOffset * SLOTS_PER_RTH + rvolSlot)
+                    array.set(priorVolumes, sessionOffset, historicalVolume)
+                    if not na(historicalVolume)
+                        ctx3PriorSessions += 1
+                float priorMedian = ctx3PriorSessions == RVOL_LOOKBACK ? array.median(priorVolumes) : na
+                ctx3Rvol := not na(priorMedian) and priorMedian > 0 ? ctx3Volume / priorMedian : na
+
+                if not na(ctx3Volume)
+                    if na(array.get(currentVolumes, rvolSlot))
+                        rvolCurrentSlotCount += 1
+                    array.set(currentVolumes, rvolSlot, ctx3Volume)
+
+        // Outcomes are graded only from completed 1m bars. This makes a stop
+        // win every stop/target conflict anywhere in that full minute.
+        bool livePositionBeforeReset = lifecycle == STATE_TRIGGERED or lifecycle == STATE_T1
+        bool newOutcomeBar = livePositionBeforeReset and outcome1WasRth and not na(outcome1Time) and (na(lastOutcome1mTime) or outcome1Time != lastOutcome1mTime) and not na(entryTime) and outcome1Time >= entryTime
+        if newOutcomeBar
+            lastOutcome1mTime := outcome1Time
+            bool stopTouched = planSide == 1 ? outcome1Low <= stopPrice : outcome1High >= stopPrice
+            bool target1Touched = planSide == 1 ? outcome1High >= target1Price : outcome1Low <= target1Price
+            bool target2Touched = planSide == 1 ? outcome1High >= target2Price : outcome1Low <= target2Price
+            if stopTouched
+                lifecycle := STATE_STOPPED
+                terminalTime := outcome1CloseTime
+                sessionFinished := true
+            else if target2Touched
+                lifecycle := STATE_TARGET_2
+                target1Hit := true
+                terminalTime := outcome1CloseTime
+                sessionFinished := true
+            else
+                if target1Touched and not target1Hit
+                    lifecycle := STATE_T1
+                    target1Hit := true
+                if outcome1CloseTime >= holdDeadline or outcome1IsLastRegular
+                    lifecycle := STATE_TIME_EXIT
+                    terminalTime := outcome1CloseTime
+                    sessionFinished := true
+
+        // Reset only when the first new RTH bar arrives, after any prior-day
+        // position received its final completed-minute outcome.
+        if startsRth
+            openingHigh := na
+            openingLow := na
+            openingLocked := false
+            setupStage := 0
+            sessionFinished := false
+            breakoutSide := 0
+            breakoutTime := na
+            breakoutVolume := na
+            breakoutRvol := na
+            pullbackStop := na
+            pullbackTime := na
+            planId := 0
+            lifecycle := STATE_IDLE
+            planSide := 0
+            signalTime := na
+            entryDeadline := na
+            entryTime := na
+            holdDeadline := na
+            terminalTime := na
+            entryPrice := na
+            stopPrice := na
+            target1Price := na
+            target2Price := na
+            target1Hit := false
+
+        bool ctx3SameDay = not na(ctx3Time) and year(ctx3Time, TZ) == year(sourceTime, TZ) and month(ctx3Time, TZ) == month(sourceTime, TZ) and dayofmonth(ctx3Time, TZ) == dayofmonth(sourceTime, TZ)
+        if inRth and ctx3SameDay and (na(lastProcessed3mTime) or ctx3Time != lastProcessed3mTime)
+            lastProcessed3mTime := ctx3Time
+            int ctx3ClockSeconds = hour(ctx3Time, TZ) * 3600 + minute(ctx3Time, TZ) * 60
+            bool ctx3InOpeningRange = ctx3ClockSeconds >= 9 * 3600 + 30 * 60 and ctx3ClockSeconds < 9 * 3600 + 45 * 60
+            if ctx3InOpeningRange
+                openingHigh := na(openingHigh) ? ctx3High : math.max(openingHigh, ctx3High)
+                openingLow := na(openingLow) ? ctx3Low : math.min(openingLow, ctx3Low)
+            if ctx3CloseTime >= timestamp(TZ, year(ctx3Time, TZ), month(ctx3Time, TZ), dayofmonth(ctx3Time, TZ), 9, 45) and not na(openingHigh) and not na(openingLow)
+                openingLocked := true
+
+            bool longAligned = bias3 == 1 and longPeerCount >= 2
+            bool shortAligned = bias3 == -1 and shortPeerCount >= 2
+            bool firstOutsideLong = ctx3Close > openingHigh and ctx3PreviousClose <= openingHigh
+            bool firstOutsideShort = ctx3Close < openingLow and ctx3PreviousClose >= openingLow
+            bool fullRvolBaseline = ctx3PriorSessions == RVOL_LOOKBACK and not na(ctx3Rvol)
+            bool longExpansion = firstOutsideLong and longAligned and fullRvolBaseline and ctx3Rvol >= RVOL_FLOOR and ctx3Close <= ctx3UpperTwo
+            bool shortExpansion = firstOutsideShort and shortAligned and fullRvolBaseline and ctx3Rvol >= RVOL_FLOOR and ctx3Close >= ctx3LowerTwo
+            bool expansionEligible = not sessionFinished and lifecycle == STATE_IDLE and openingLocked and ctx3ClockSeconds >= 9 * 3600 + 45 * 60
+            if expansionEligible and setupStage == 0 and (firstOutsideLong or firstOutsideShort)
+                if not fullRvolBaseline
+                    setupStage := -2
+                    sessionFinished := true
+                else if longExpansion or shortExpansion
+                    breakoutSide := longExpansion ? 1 : -1
+                    breakoutTime := ctx3CloseTime
+                    breakoutVolume := ctx3Volume
+                    breakoutRvol := ctx3Rvol
+                    setupStage := 1
+                else
+                    setupStage := -1
+                    sessionFinished := true
+            else if not sessionFinished and lifecycle == STATE_IDLE and setupStage == 1
+                bool expiredBreakout = ctx3CloseTime > breakoutTime + PULLBACK_WINDOW_MS
+                if expiredBreakout
+                    setupStage := -1
+                    sessionFinished := true
+                else
+                    float pullbackLevel = breakoutSide == 1 ? math.max(ctx3Ema9, openingHigh) : math.min(ctx3Ema9, openingLow)
+                    bool lowerVolume = ctx3Volume < breakoutVolume
+                    bool firstPullbackTouch = ctx3Low <= pullbackLevel and ctx3High >= pullbackLevel
+                    if firstPullbackTouch
+                        bool pullbackHeld = breakoutSide == 1 ? (ctx3Close > pullbackLevel and ctx3Close > ctx3Vwap) : (ctx3Close < pullbackLevel and ctx3Close < ctx3Vwap)
+                        if lowerVolume and pullbackHeld
+                            pullbackStop := breakoutSide == 1 ? ctx3Low : ctx3High
+                            pullbackTime := ctx3CloseTime
+                            setupStage := 2
+                        else
+                            setupStage := -1
+                            sessionFinished := true
+
+        bool ctx1SameDay = not na(ctx1Time) and year(ctx1Time, TZ) == year(sourceTime, TZ) and month(ctx1Time, TZ) == month(sourceTime, TZ) and dayofmonth(ctx1Time, TZ) == dayofmonth(sourceTime, TZ)
+        if inRth and ctx1SameDay and not sessionFinished and lifecycle == STATE_IDLE and setupStage == 2 and (na(lastProcessed1mTime) or ctx1Time != lastProcessed1mTime)
+            lastProcessed1mTime := ctx1Time
+            bool insideResumptionWindow = ctx1Time >= pullbackTime and ctx1CloseTime <= breakoutTime + RESUMPTION_WINDOW_MS
+            if insideResumptionWindow
+                pullbackStop := breakoutSide == 1 ? math.min(pullbackStop, ctx1Low) : math.max(pullbackStop, ctx1High)
+            bool resumptionExpired = ctx1CloseTime > breakoutTime + RESUMPTION_WINDOW_MS
+            bool longAlignedNow = bias3 == 1 and longPeerCount >= 2
+            bool shortAlignedNow = bias3 == -1 and shortPeerCount >= 2
+            bool longResumption = breakoutSide == 1 and longAlignedNow and ctx1Time >= pullbackTime and ctx1Close > ctx1Open and ctx1Close > ctx1PreviousHigh and ctx1Close > ctx1Ema9 and ctx1Close > ctx1Vwap
+            bool shortResumption = breakoutSide == -1 and shortAlignedNow and ctx1Time >= pullbackTime and ctx1Close < ctx1Open and ctx1Close < ctx1PreviousLow and ctx1Close < ctx1Ema9 and ctx1Close < ctx1Vwap
+            if resumptionExpired
+                setupStage := -1
+                sessionFinished := true
+            else if longResumption or shortResumption
+                planSide := longResumption ? 1 : -1
+                signalTime := ctx1CloseTime
+                entryDeadline := signalTime + ENTRY_WINDOW_MS
+                planId := signalTime * 10 + (planSide == 1 ? 1 : 2)
+                lifecycle := STATE_ARMED
+                setupStage := 3
+
+        // A completed 1m resumption becomes known exactly when the next real
+        // minute opens. Fill only that exact open; never backdate a missed fill.
+        if lifecycle == STATE_ARMED
+            bool exactNextOpen = inRth and sourceTime == signalTime and second(sourceTime, TZ) == 0
+            if exactNextOpen
+                float candidateRisk = planSide == 1 ? sourceOpen - pullbackStop : pullbackStop - sourceOpen
+                bool gapThroughStop = planSide == 1 ? sourceOpen <= pullbackStop : sourceOpen >= pullbackStop
+                if gapThroughStop or na(candidateRisk) or candidateRisk <= 0
+                    lifecycle := STATE_INVALIDATED
+                    terminalTime := sourceTime
+                    sessionFinished := true
+                else
+                    entryTime := sourceTime
+                    entryPrice := sourceOpen
+                    stopPrice := pullbackStop
+                    target1Price := entryPrice + planSide * candidateRisk * TARGET_1_R
+                    target2Price := entryPrice + planSide * candidateRisk * TARGET_2_R
+                    holdDeadline := math.min(entryTime + HOLD_WINDOW_MS, timestamp(TZ, year(entryTime, TZ), month(entryTime, TZ), dayofmonth(entryTime, TZ), 16, 0))
+                    lifecycle := STATE_TRIGGERED
+            else if sourceTime > signalTime or not inRth
+                lifecycle := STATE_EXPIRED
+                terminalTime := sourceTime
+                sessionFinished := true
+
+    // A regular-only engine has no post-market heartbeat. At the closing tick
+    // of its exchange-defined final 30s bar, grade the complete final minute
+    // from its two standard-price halves, then apply the session time exit.
+    // The separate close-time guard keeps this from firing at 15:59:30 live.
+    if sessionBoundaryReady and (na(lastSessionBoundaryCloseTime) or sourceCloseTime != lastSessionBoundaryCloseTime)
+        lastSessionBoundaryCloseTime := sourceCloseTime
+        int finalMinuteTime = time("1")
+        bool previousSharesFinalMinute = time("1")[1] == finalMinuteTime
+        float finalMinuteHigh = previousSharesFinalMinute ? math.max(sourceHigh, high[1]) : sourceHigh
+        float finalMinuteLow = previousSharesFinalMinute ? math.min(sourceLow, low[1]) : sourceLow
+        bool livePositionAtBoundary = lifecycle == STATE_TRIGGERED or lifecycle == STATE_T1
+        bool finalMinuteNeedsGrading = livePositionAtBoundary and not na(entryTime) and finalMinuteTime >= entryTime and (na(lastOutcome1mTime) or lastOutcome1mTime != finalMinuteTime)
+        if finalMinuteNeedsGrading
+            lastOutcome1mTime := finalMinuteTime
+            bool stopTouched = planSide == 1 ? finalMinuteLow <= stopPrice : finalMinuteHigh >= stopPrice
+            bool target1Touched = planSide == 1 ? finalMinuteHigh >= target1Price : finalMinuteLow <= target1Price
+            bool target2Touched = planSide == 1 ? finalMinuteHigh >= target2Price : finalMinuteLow <= target2Price
+            if stopTouched
+                lifecycle := STATE_STOPPED
+                terminalTime := sourceCloseTime
+                sessionFinished := true
+            else if target2Touched
+                lifecycle := STATE_TARGET_2
+                target1Hit := true
+                terminalTime := sourceCloseTime
+                sessionFinished := true
+            else if target1Touched and not target1Hit
+                lifecycle := STATE_T1
+                target1Hit := true
+        bool stillLiveAtBoundary = lifecycle == STATE_TRIGGERED or lifecycle == STATE_T1
+        if stillLiveAtBoundary
+            lifecycle := STATE_TIME_EXIT
+            terminalTime := sourceCloseTime
+            sessionFinished := true
+        else if lifecycle == STATE_ARMED
+            lifecycle := STATE_EXPIRED
+            terminalTime := sourceCloseTime
+            sessionFinished := true
+        lastRthAsOf := sourceCloseTime
+        engineAsOf := sourceCloseTime
+
+    [planId, lifecycle, planSide, signalTime, entryDeadline, entryTime, holdDeadline, terminalTime, entryPrice, stopPrice, target1Price, target2Price, target1Hit, engineAsOf, setupStage, breakoutRvol]
+
+[planId, lifecycle, planSide, signalTime, entryDeadline, entryTime, holdDeadline, terminalTime, entryPrice, stopPrice, target1Price, target2Price, target1Hit, engineAsOf, setupStage, breakoutRelativeVolume] = request.security(
+     engineTicker,
+     ENGINE_TF,
+     f_canonical_engine(),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off,
+     calc_bars_count=ENGINE_CALC_BARS
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chart-native directional score
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The pane's own relative volume. One definition, shared by the dots and by the
+// score's participation family, so the chart and the HUD always agree.
+float rvolBaseline = ta.sma(volume[1], rvolMarkLen)
+float rvolRatio = not na(rvolBaseline) and rvolBaseline > 0 ? volume / rvolBaseline : na
+
+// The 30s pane draws Heikin-Ashi, so its own VWAP has to come from standard
+// prices; a Heikin-Ashi VWAP is an average of averages and drifts off the real
+// volume-weighted price. This same request also supplies the plotted bands.
+// The timeframe is named EXPLICITLY rather than passed as timeframe.period:
+// the period form came back empty in Bar Replay while the identical request with
+// a literal timeframe string was served fine from the other panes.
+string ownTfString = isThreeMinute ? "3" : isOneMinute ? "1" : "30S"
+[standardVwap, standardVwapUpper, standardVwapLower] = request.security(
+     standardTicker,
+     ownTfString,
+     f_session_vwap(),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off,
+     calc_bars_count=DISPLAY_CALC_BARS
+)
+// On the 30s pane the request above is same-timeframe, which Replay will not serve,
+// so relay the identical request through a 1-minute context - a lower-timeframe
+// request, which Replay does serve. Without this the Heikin-Ashi pane silently
+// falls back to an average-of-averages VWAP that drifts off the real one.
+[relayVwap, relayVwapUpper, relayVwapLower] = request.security(
+     standardTicker,
+     "1",
+     f_thirty_second_vwap(),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off,
+     calc_bars_count=DISPLAY_CALC_BARS
+)
+// Preference order: the direct standard request, then the relayed one, then this
+// pane's own candles. On a STANDARD chart that last fallback is already standard
+// prices and costs nothing; only on Heikin-Ashi is it a real compromise, which is
+// exactly when the HUD says so.
+[nativeVwap, nativeVwapUpper, nativeVwapLower] = f_session_vwap()
+float sessionVwap = not na(standardVwap) ? standardVwap : not na(relayVwap) ? relayVwap : nativeVwap
+float sessionVwapUpper = not na(standardVwap) ? standardVwapUpper : not na(relayVwap) ? relayVwapUpper : nativeVwapUpper
+float sessionVwapLower = not na(standardVwap) ? standardVwapLower : not na(relayVwap) ? relayVwapLower : nativeVwapLower
+float ownVwap = sessionVwap
+bool vwapUsedChartPrices = na(standardVwap) and na(relayVwap) and not na(nativeVwap) and not chart.is_standard
+
+// Own-timeframe evidence, computed on this pane's own bars.
+float ownStFactor = isThreeMinute ? stFactor3 : isOneMinute ? stFactor1 : stFactor30
+int ownStLength = isThreeMinute ? stLength3 : isOneMinute ? stLength1 : stLength30
+float ownEma9 = ta.ema(close, 9)
+[_ownStValue, ownStDirectionInternal] = ta.supertrend(ownStFactor, ownStLength)
+[ownDiPlusInternal, ownDiMinusInternal, ownAdxInternal] = ta.dmi(dmiLength, adxSmoothing)
+float ownOscInternal = ta.roc(close, oscLen)
+float ownAtr = ta.atr(14)
+float ownSwingHigh = ta.highest(high[1], structLen)
+float ownSwingLow = ta.lowest(low[1], structLen)
+bool ownBrokeUp = not na(ownSwingHigh) and close > ownSwingHigh
+bool ownBrokeDown = not na(ownSwingLow) and close < ownSwingLow
+
+// A source input that has been enabled but never pointed at a plot still returns
+// the default `close`. Detect that honestly instead of scoring price as if it
+// were an oscillator: once the series differs from close even once, it is wired.
+var bool boomIsWired = false
+var bool mySupertrendIsWired = false
+var bool myDmiIsWired = false
+if useMyBoom and myBoomSource != close
+    boomIsWired := true
+if useMySupertrend and mySupertrendSource != close
+    mySupertrendIsWired := true
+if useMyDmi and (myDiPlusSource != close or myDiMinusSource != close)
+    myDmiIsWired := true
+
+float ownStDirection = useMySupertrend and mySupertrendIsWired and not na(mySupertrendSource) ? (close > mySupertrendSource ? -1.0 : close < mySupertrendSource ? 1.0 : na) : ownStDirectionInternal
+float ownDiPlus = useMyDmi and myDmiIsWired ? myDiPlusSource : ownDiPlusInternal
+float ownDiMinus = useMyDmi and myDmiIsWired ? myDiMinusSource : ownDiMinusInternal
+float ownAdx = useMyDmi and myDmiIsWired ? myAdxSource : ownAdxInternal
+float ownOsc = useMyBoom and boomIsWired ? myBoomSource : ownOscInternal
+float ownOscRank = ta.percentrank(ownOsc, oscRankLen)
+
+// Native family votes from this pane's own bars. These carry the wired studies
+// (which cannot travel into a request for another timeframe) and also act as the
+// fallback if the same-timeframe standard request comes back empty.
+[nativeTrendL, nativeTrendS, nativeTrendA] = f_vote_trend(close, ownEma9, ownEma9[1], ownVwap)
+[nativeStL, nativeStS, nativeStA] = f_vote_supertrend(ownStDirection)
+[nativeDmiL, nativeDmiS, nativeDmiA] = f_vote_dmi(ownDiPlus, ownDiMinus, ownAdx)
+[nativeOscL, nativeOscS, nativeOscA] = f_vote_oscillator(ownOscRank, ownOsc, ownOsc[1])
+[nativeStructL, nativeStructS, nativeStructA] = f_vote_structure(close, ownBrokeUp, ownBrokeDown)
+
+// Own-pane exhaustion read, for the DRIVERS row marker only - the vote-zeroing itself
+// already happened inside f_tf_score for the requested q3/q1/q30 rungs (see there). This
+// is a separate, structurally required same-bars recomputation (Pine cannot carry a value
+// out of f_tf_score's request.security context back into this scope), same pattern as the
+// rvolRatio duplication above.
+bool ownExhLong = false
+bool ownExhShort = false
+if useExhaustionVeto
+    [exhLongOwn, exhShortOwn] = f_exhaustion_state(ownVwap, rvolRatio)
+    ownExhLong := exhLongOwn
+    ownExhShort := exhShortOwn
+bool supertrendSwapped = useMySupertrend and mySupertrendIsWired
+bool dmiSwapped = useMyDmi and myDmiIsWired
+bool oscillatorSwapped = useMyBoom and boomIsWired
+
+// The other two rungs. Each pane computes its OWN timeframe natively - that is
+// the one that can use the studies wired above - and requests the other two.
+// Requesting a LOWER timeframe is the price of letting a 3m pane feel a 30s
+// reversal. Bar Replay may refuse to serve it, or worse, hand back the last value
+// it ever had; the staleness guard below is what makes that safe rather than
+// silently wrong.
+// EVERY pane requests ALL THREE rungs from the same standard-price series, so
+// "30s DOWN" means exactly the same thing whether you read it on the 30s pane or
+// on the 3m. Previously each pane computed its own rung from its own candles,
+// which on the Heikin-Ashi 30s pane produced a different answer for the same
+// timeframe - the 3m pane said "30s DOWN" while the 30s pane said "30s FLAT".
+[q3TrendL, q3TrendS, q3TrendA, q3StL, q3StS, q3StA, q3DmiL, q3DmiS, q3DmiA, q3OscL, q3OscS, q3OscA, q3StructL, q3StructS, q3StructA, q3Rvol, q3Time] = request.security(
+     standardTicker,
+     "3",
+     f_tf_score(stFactor3, stLength3),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off,
+     calc_bars_count=SCORE_CONTEXT_CALC_BARS
+)
+[q1TrendL, q1TrendS, q1TrendA, q1StL, q1StS, q1StA, q1DmiL, q1DmiS, q1DmiA, q1OscL, q1OscS, q1OscA, q1StructL, q1StructS, q1StructA, q1Rvol, q1Time] = request.security(
+     standardTicker,
+     "1",
+     f_tf_score(stFactor1, stLength1),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off,
+     calc_bars_count=SCORE_CONTEXT_CALC_BARS
+)
+[q30TrendL, q30TrendS, q30TrendA, q30StL, q30StS, q30StA, q30DmiL, q30DmiS, q30DmiA, q30OscL, q30OscS, q30OscA, q30StructL, q30StructS, q30StructA, q30Rvol, q30Time] = request.security(
+     standardTicker,
+     "30S",
+     f_tf_score(stFactor30, stLength30),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off,
+     calc_bars_count=SCORE_CONTEXT_CALC_BARS
+)
+// Same 30-second rung, relayed through a 1-minute context. On the 3m and 1m panes
+// the direct request above already works and this is redundant; on the 30s pane the
+// direct one is a same-timeframe request and Replay returns nothing, so this is the
+// path that keeps that pane reading standard prices instead of Heikin-Ashi.
+[r30TrendL, r30TrendS, r30TrendA, r30StL, r30StS, r30StA, r30DmiL, r30DmiS, r30DmiA, r30OscL, r30OscS, r30OscA, r30StructL, r30StructS, r30StructA, r30Rvol, r30Time] = request.security(
+     standardTicker,
+     "1",
+     f_thirty_second_rung(),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off,
+     calc_bars_count=SCORE_CONTEXT_CALC_BARS
+)
+
+// Cross-index breadth, read at 3m from every pane.
+string spyScoreTicker = ticker.new("AMEX", "SPY", session.regular)
+string qqqScoreTicker = ticker.new("NASDAQ", "QQQ", session.regular)
+string iwmScoreTicker = ticker.new("AMEX", "IWM", session.regular)
+float spyDirection = request.security(spyScoreTicker, "3", f_peer_direction(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=SCORE_PEER_CALC_BARS)
+float qqqDirection = request.security(qqqScoreTicker, "3", f_peer_direction(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=SCORE_PEER_CALC_BARS)
+float iwmDirection = request.security(iwmScoreTicker, "3", f_peer_direction(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=SCORE_PEER_CALC_BARS)
+int peersReporting = (na(spyDirection) ? 0 : 1) + (na(qqqDirection) ? 0 : 1) + (na(iwmDirection) ? 0 : 1)
+int peersLong = (spyDirection == 1 ? 1 : 0) + (qqqDirection == 1 ? 1 : 0) + (iwmDirection == 1 ? 1 : 0)
+int peersShort = (spyDirection == -1 ? 1 : 0) + (qqqDirection == -1 ? 1 : 0) + (iwmDirection == -1 ? 1 : 0)
+float peerLongFraction = peersReporting == 3 ? (peersLong >= 2 ? 1.0 : 0.0) : na
+float peerShortFraction = peersReporting == 3 ? (peersShort >= 2 ? 1.0 : 0.0) : na
+
+// Assemble the three rungs. A rung is built from the shared standard-price request
+// so every pane agrees on it. The pane that OWNS a timeframe then swaps in whatever
+// studies are wired on its chart, and falls back to its own candles entirely if the
+// request came back empty - so a rung degrades to "less consistent" rather than
+// "missing".
+int chartTfMs = timeframe.in_seconds() * 1000
+int chartCloseTime = time_close
+bool q3Ok = not na(q3TrendA)
+bool q1Ok = not na(q1TrendA)
+bool q30Direct = not na(q30TrendA)
+// Relayed through the 1-minute context so Replay will serve it on the 30s pane.
+bool q30Relayed = not q30Direct and not na(r30TrendA)
+bool q30Ok = q30Direct or q30Relayed
+int q30TrendLong = q30Direct ? q30TrendL : r30TrendL
+int q30TrendShort = q30Direct ? q30TrendS : r30TrendS
+int q30TrendAvail = q30Direct ? q30TrendA : r30TrendA
+int q30StLong = q30Direct ? q30StL : r30StL
+int q30StShort = q30Direct ? q30StS : r30StS
+int q30StAvail = q30Direct ? q30StA : r30StA
+int q30DmiLong = q30Direct ? q30DmiL : r30DmiL
+int q30DmiShort = q30Direct ? q30DmiS : r30DmiS
+int q30DmiAvail = q30Direct ? q30DmiA : r30DmiA
+int q30OscLong = q30Direct ? q30OscL : r30OscL
+int q30OscShort = q30Direct ? q30OscS : r30OscS
+int q30OscAvail = q30Direct ? q30OscA : r30OscA
+int q30StructLong = q30Direct ? q30StructL : r30StructL
+int q30StructShort = q30Direct ? q30StructS : r30StructS
+int q30StructAvail = q30Direct ? q30StructA : r30StructA
+float q30RvolValue = q30Direct ? q30Rvol : r30Rvol
+float q30TimeValue = q30Direct ? q30Time : r30Time
+bool native3 = isThreeMinute and not q3Ok
+bool native1 = isOneMinute and not q1Ok
+bool native30 = isThirtySecond and not q30Ok
+
+[rung3LongVotes, rung3ShortVotes, rung3Available] = f_assemble_rung(
+     native3 ? nativeTrendL : q3TrendL, native3 ? nativeTrendS : q3TrendS, native3 ? nativeTrendA : q3TrendA,
+     (isThreeMinute and supertrendSwapped) or native3 ? nativeStL : q3StL, (isThreeMinute and supertrendSwapped) or native3 ? nativeStS : q3StS, (isThreeMinute and supertrendSwapped) or native3 ? nativeStA : q3StA,
+     (isThreeMinute and dmiSwapped) or native3 ? nativeDmiL : q3DmiL, (isThreeMinute and dmiSwapped) or native3 ? nativeDmiS : q3DmiS, (isThreeMinute and dmiSwapped) or native3 ? nativeDmiA : q3DmiA,
+     (isThreeMinute and oscillatorSwapped) or native3 ? nativeOscL : q3OscL, (isThreeMinute and oscillatorSwapped) or native3 ? nativeOscS : q3OscS, (isThreeMinute and oscillatorSwapped) or native3 ? nativeOscA : q3OscA,
+     native3 ? nativeStructL : q3StructL, native3 ? nativeStructS : q3StructS, native3 ? nativeStructA : q3StructA,
+     isThreeMinute ? rvolRatio : q3Rvol)
+
+[rung1LongVotes, rung1ShortVotes, rung1Available] = f_assemble_rung(
+     native1 ? nativeTrendL : q1TrendL, native1 ? nativeTrendS : q1TrendS, native1 ? nativeTrendA : q1TrendA,
+     (isOneMinute and supertrendSwapped) or native1 ? nativeStL : q1StL, (isOneMinute and supertrendSwapped) or native1 ? nativeStS : q1StS, (isOneMinute and supertrendSwapped) or native1 ? nativeStA : q1StA,
+     (isOneMinute and dmiSwapped) or native1 ? nativeDmiL : q1DmiL, (isOneMinute and dmiSwapped) or native1 ? nativeDmiS : q1DmiS, (isOneMinute and dmiSwapped) or native1 ? nativeDmiA : q1DmiA,
+     (isOneMinute and oscillatorSwapped) or native1 ? nativeOscL : q1OscL, (isOneMinute and oscillatorSwapped) or native1 ? nativeOscS : q1OscS, (isOneMinute and oscillatorSwapped) or native1 ? nativeOscA : q1OscA,
+     native1 ? nativeStructL : q1StructL, native1 ? nativeStructS : q1StructS, native1 ? nativeStructA : q1StructA,
+     isOneMinute ? rvolRatio : q1Rvol)
+
+[rung30LongVotes, rung30ShortVotes, rung30Available] = f_assemble_rung(
+     native30 ? nativeTrendL : q30TrendLong, native30 ? nativeTrendS : q30TrendShort, native30 ? nativeTrendA : q30TrendAvail,
+     (isThirtySecond and supertrendSwapped) or native30 ? nativeStL : q30StLong, (isThirtySecond and supertrendSwapped) or native30 ? nativeStS : q30StShort, (isThirtySecond and supertrendSwapped) or native30 ? nativeStA : q30StAvail,
+     (isThirtySecond and dmiSwapped) or native30 ? nativeDmiL : q30DmiLong, (isThirtySecond and dmiSwapped) or native30 ? nativeDmiS : q30DmiShort, (isThirtySecond and dmiSwapped) or native30 ? nativeDmiA : q30DmiAvail,
+     (isThirtySecond and oscillatorSwapped) or native30 ? nativeOscL : q30OscLong, (isThirtySecond and oscillatorSwapped) or native30 ? nativeOscS : q30OscShort, (isThirtySecond and oscillatorSwapped) or native30 ? nativeOscA : q30OscAvail,
+     native30 ? nativeStructL : q30StructLong, native30 ? nativeStructS : q30StructShort, native30 ? nativeStructA : q30StructAvail,
+     isThirtySecond ? rvolRatio : q30RvolValue)
+
+float rung3Long = not na(rung3Available) and rung3Available > 0 ? rung3LongVotes / rung3Available : na
+float rung3Short = not na(rung3Available) and rung3Available > 0 ? rung3ShortVotes / rung3Available : na
+float rung1Long = not na(rung1Available) and rung1Available > 0 ? rung1LongVotes / rung1Available : na
+float rung1Short = not na(rung1Available) and rung1Available > 0 ? rung1ShortVotes / rung1Available : na
+float rung30Long = not na(rung30Available) and rung30Available > 0 ? rung30LongVotes / rung30Available : na
+float rung30Short = not na(rung30Available) and rung30Available > 0 ? rung30ShortVotes / rung30Available : na
+float rung3CloseTime = native3 ? chartCloseTime : q3Time
+float rung1CloseTime = native1 ? chartCloseTime : q1Time
+float rung30CloseTime = native30 ? chartCloseTime : q30TimeValue
+int rung3Direction = rung3LongVotes > rung3ShortVotes ? 1 : rung3ShortVotes > rung3LongVotes ? -1 : 0
+int rung1Direction = rung1LongVotes > rung1ShortVotes ? 1 : rung1ShortVotes > rung1LongVotes ? -1 : 0
+int rung30Direction = rung30LongVotes > rung30ShortVotes ? 1 : rung30ShortVotes > rung30LongVotes ? -1 : 0
+
+// Staleness guard. A rung is only allowed to vote if it reported AND its own bar
+// close is recent relative to this chart's bar. Higher timeframes legitimately lag
+// by up to their own bar length, so the budget scales with both.
+bool rung3Fresh = not na(rung3Long) and not na(rung3CloseTime) and (chartCloseTime - rung3CloseTime) <= staleRungMultiple * (3 * MINUTE_MS + chartTfMs)
+bool rung1Fresh = not na(rung1Long) and not na(rung1CloseTime) and (chartCloseTime - rung1CloseTime) <= staleRungMultiple * (MINUTE_MS + chartTfMs)
+bool rung30Fresh = not na(rung30Long) and not na(rung30CloseTime) and (chartCloseTime - rung30CloseTime) <= staleRungMultiple * (MINUTE_MS / 2 + chartTfMs)
+
+// Weight matrix: which timeframe speaks loudest on this pane.
+float weightOn3m = isThreeMinute ? weight3mPaneOn3m : isOneMinute ? weight1mPaneOn3m : weight30sPaneOn3m
+float weightOn1m = isThreeMinute ? weight3mPaneOn1m : isOneMinute ? weight1mPaneOn1m : weight30sPaneOn1m
+float weightOn30s = isThreeMinute ? weight3mPaneOn30s : isOneMinute ? weight1mPaneOn30s : weight30sPaneOn30s
+
+float ladderWeight = (rung3Fresh ? weightOn3m : 0.0) + (rung1Fresh ? weightOn1m : 0.0) + (rung30Fresh ? weightOn30s : 0.0)
+float ladderLong = (rung3Fresh ? weightOn3m * rung3Long : 0.0) + (rung1Fresh ? weightOn1m * rung1Long : 0.0) + (rung30Fresh ? weightOn30s * rung30Long : 0.0)
+float ladderShort = (rung3Fresh ? weightOn3m * rung3Short : 0.0) + (rung1Fresh ? weightOn1m * rung1Short : 0.0) + (rung30Fresh ? weightOn30s * rung30Short : 0.0)
+float ladderLongFraction = ladderWeight > 0 ? ladderLong / ladderWeight : na
+float ladderShortFraction = ladderWeight > 0 ? ladderShort / ladderWeight : na
+// True when a rung this pane wants is absent or stale, so the HUD can say so.
+int rungsReporting = (rung3Fresh ? 1 : 0) + (rung1Fresh ? 1 : 0) + (rung30Fresh ? 1 : 0)
+bool rungMissing = rungsReporting < 3
+// A perfect 10 must MEAN something: all three timeframes looked, and all three
+// agreed. Renormalising a missing rung keeps the score honest about direction but
+// would otherwise let a pane that can only see itself climb back to 10 and imply
+// an agreement it never checked. Each rung that could not report lowers the
+// ceiling by one, so incomplete evidence can never read as total conviction.
+int scoreCeiling = 10 - (3 - rungsReporting)
+
+// Breadth is a modifier, never a standalone verdict. If no rung of the ladder
+// reported at all there is no score to modify, and the HUD says so rather than
+// printing a confident 10 built out of nothing but three peer symbols.
+float peerShare = na(peerLongFraction) ? 0.0 : peerWeight
+float combinedWeight = (na(ladderLongFraction) ? 0.0 : 1.0 - peerWeight) + peerShare
+float combinedLong = na(ladderLongFraction) or combinedWeight <= 0 ? na : ((1.0 - peerWeight) * ladderLongFraction + (na(peerLongFraction) ? 0.0 : peerWeight * peerLongFraction)) / combinedWeight
+float combinedShort = na(ladderShortFraction) or combinedWeight <= 0 ? na : ((1.0 - peerWeight) * ladderShortFraction + (na(peerShortFraction) ? 0.0 : peerWeight * peerShortFraction)) / combinedWeight
+
+// Anti-chase. Price already stretched far beyond its own EMA9 is a worse entry,
+// not a better one, so the extended side gives a point back.
+bool overExtendedUp = not na(ownAtr) and ownAtr > 0 and (close - ownEma9) > chaseAtrMult * ownAtr
+bool overExtendedDown = not na(ownAtr) and ownAtr > 0 and (ownEma9 - close) > chaseAtrMult * ownAtr
+
+// Counter-trend scalp tilt. Fires only when BOTH fast rungs reported, agree on a
+// direction, and the 3m actively disagrees - a flat 3m is not disagreement, and a
+// 1m/30s split is not agreement, so neither earns the tilt.
+int fastDirection = rung1Fresh and rung30Fresh and rung1Direction != 0 and rung1Direction == rung30Direction ? rung1Direction : 0
+bool fastOpposesContext = fastDirection != 0 and rung3Fresh and rung3Direction == -fastDirection
+float scalpEdge = fastOpposesContext ? (isThirtySecond ? scalpEdge30sPane : isOneMinute ? scalpEdge1mPane : 0.0) / 10.0 : 0.0
+float scalpLongAdjust = fastDirection == 1 ? scalpEdge : -scalpEdge
+float scalpShortAdjust = fastDirection == -1 ? scalpEdge : -scalpEdge
+float tiltedLong = na(combinedLong) ? na : math.max(0.0, math.min(1.0, combinedLong + scalpLongAdjust))
+float tiltedShort = na(combinedShort) ? na : math.max(0.0, math.min(1.0, combinedShort + scalpShortAdjust))
+
+// ================= LANE A v62 SCORE (generated by scripts/gen_v48_pine.py) ========
+// Fitted on SPY/QQQ/IWM 30s bars, 2025. Target: signed excursion asymmetry (MFE-MAE)
+// over 20 bars -- did the entry give room before it hurt, rather than the
+// return in N bars. The momentum component is subtracted by construction, so this score
+// does NOT track candle colour: R2 against a candle-colour/body/CLV/direction basis is
+// [n] on the untouched holdout, versus [n] for v47 and [n] for what was
+// actually shown on the chart in v49. The score side agrees with candle colour on [n]%
+// of bars, i.e. it is independent of it. Re-measured by
+// research/lane_a_score/diag_v50_candle_independence.py.
+//
+// WHY v49 SATURATED ON THE LIVE CHART, fixed 2026-07-27. research/lane_a_score/score_v3.py
+// momentum_basis() took its lags POSITIONALLY on a frame holding SPY, QQQ and IWM stacked
+// and sorted by timestamp, so 95.8% of adjacent rows were a different symbol. The EMA9
+// slope it produced was QQQ_ema - SPY_ema over a 0.23-point ATR, i.e. ~186 ATRs per bar,
+// pinned at the +-8 clip on 99.99% of bars. The fit then produced two momentum weights of
+// +8.70 (sign) and -1.09 (level) that cancelled ONLY because 8.70 - 1.09*8 ~ 0. Pine
+// computes a real per-symbol slope of ~0.1 ATR, so nothing cancelled and ~[n] bp of raw
+// sign(EMA9 slope) survived -- 9 HUD points, flipping 10/0 long to 0/10 short every time
+// the slope changed sign. With the basis fixed that weight is -0.003 and the mapping is
+// no longer a knife-edge between two large opposing terms.
+//
+// LIMITATION, kept in the code so it cannot be lost: this score is a read-out and not a
+// trading signal. It replaces a score that mirrored the candles. Validation compares it
+// with random bar selection in 5-fold CV and by excursion asymmetry. Those figures are
+// redacted here.
+// Regenerate with scripts/gen_v48_pine.py after any refit; never hand-edit coefficients.
+
+// 8 series from the 30S rung -- only what the fitted model uses there.
+f_v48_f0(stFactor) =>
+    _c      = close
+    _atr    = ta.atr(14)
+    _atrS   = _atr > 0 ? _atr : na
+    _vwap   = ta.vwap(hlc3)
+    _ema9   = ta.ema(_c, 9)
+    [_dip, _dim, _adx] = ta.dmi(14, 14)
+    _osc    = ta.roc(_c, 9)
+    _rank   = ta.percentrank(_osc, 60)
+    _vsma   = ta.sma(volume, 20)
+    _vsma1  = _vsma[1]
+    _rvol   = _vsma1 > 0 ? volume / _vsma1 : 1.0
+    [_stLine, _stDir] = ta.supertrend(stFactor, 10)
+    _rsi    = ta.rsi(_c, 14)
+    _hh     = ta.highest(high, 20)
+    _ll     = ta.lowest(low, 20)
+    _hi20   = _hh[1]
+    _lo20   = _ll[1]
+    var float _sesHi = na
+    var float _sesLo = na
+    _newDay = ta.change(time("D")) != 0
+    _sesHi := _newDay or na(_sesHi) ? high : math.max(_sesHi, high)
+    _sesLo := _newDay or na(_sesLo) ? low : math.min(_sesLo, low)
+    _flip   = ta.change(_stDir) != 0
+    _age    = ta.barssince(_flip)
+    _anchor = ta.valuewhen(_flip, _c, 0)
+    _mins   = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+    _tod    = math.max(0.0, math.min(1.0, (_mins - 570.0) / 390.0))
+    _rel    = _atr / _c
+    _relEma = ta.ema(_rel, 1000)
+    _span   = _hi20 - _lo20
+    _sspan  = _sesHi - _sesLo
+    _pchg   = math.sign(_c - _c[10])
+    _rchg   = math.sign(nz(_rsi) - nz(_rsi[10]))
+    _phv    = ta.pivothigh(high, 3, 3)
+    _plv    = ta.pivotlow(low, 3, 3)
+    var float _lastPH = na
+    var float _lastPL = na
+    _lastPH := na(_phv) ? _lastPH : _phv
+    _lastPL := na(_plv) ? _lastPL : _plv
+    var int _bos = 0
+    var int _bosAge = 0
+    _bosNew = not na(_lastPH) and _c > _lastPH ? 1 : (not na(_lastPL) and _c < _lastPL ? -1 : _bos)
+    _bosAge := _bosNew != _bos ? 0 : _bosAge + 1
+    _bos    := _bosNew
+    _o01 = math.max(-2.0, math.min(3.0, nz(_adx) / 25.0 - 1.0))
+    _o02 = float(_bos)
+    _o03 = math.max(0.0, math.min(1.0, (20.0 - _bosAge) / 20.0))
+    _o04 = math.max(-3.0, math.min(3.0, (nz(_dip) - nz(_dim)) / 25.0))
+    _o05 = math.max(-8.0, math.min(8.0, nz((_c - _stLine) / _atrS)))
+    _o06 = math.max(-8.0, math.min(8.0, nz((_c - _anchor) / _atrS)))
+    _o07 = (_stDir < 0 ? 1.0 : 0.0) - (_stDir > 0 ? 1.0 : 0.0)
+    _o08 = math.max(-1.0, math.min(4.0, (na(_relEma) or _relEma <= 0 ? 1.0 : _rel / _relEma) - 1.0))
+    _m1 = math.sign(_c - open)
+    _m2 = math.sign(_c[1] - open[1])
+    _m3 = math.sign(_c[2] - open[2])
+    _r5 = math.max(-8.0, math.min(8.0, nz((_c - _c[5]) / _atrS)))
+    _sl = math.max(-8.0, math.min(8.0, nz((_ema9 - _ema9[1]) / _atrS)))
+    _m4 = math.sign(_r5)
+    _m5 = math.sign(_sl)
+    [_o01, _o02, _o03, _o04, _o05, _o06, _o07, _o08, _m1, _m2, _m3, _m4, _m5, _r5, _sl, _rel]
+
+// 11 series from the 1 rung -- only what the fitted model uses there.
+f_v48_f1(stFactor) =>
+    _c      = close
+    _atr    = ta.atr(14)
+    _atrS   = _atr > 0 ? _atr : na
+    _vwap   = ta.vwap(hlc3)
+    _ema9   = ta.ema(_c, 9)
+    [_dip, _dim, _adx] = ta.dmi(14, 14)
+    _osc    = ta.roc(_c, 9)
+    _rank   = ta.percentrank(_osc, 60)
+    _vsma   = ta.sma(volume, 20)
+    _vsma1  = _vsma[1]
+    _rvol   = _vsma1 > 0 ? volume / _vsma1 : 1.0
+    [_stLine, _stDir] = ta.supertrend(stFactor, 10)
+    _rsi    = ta.rsi(_c, 14)
+    _hh     = ta.highest(high, 20)
+    _ll     = ta.lowest(low, 20)
+    _hi20   = _hh[1]
+    _lo20   = _ll[1]
+    var float _sesHi = na
+    var float _sesLo = na
+    _newDay = ta.change(time("D")) != 0
+    _sesHi := _newDay or na(_sesHi) ? high : math.max(_sesHi, high)
+    _sesLo := _newDay or na(_sesLo) ? low : math.min(_sesLo, low)
+    _flip   = ta.change(_stDir) != 0
+    _age    = ta.barssince(_flip)
+    _anchor = ta.valuewhen(_flip, _c, 0)
+    _mins   = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+    _tod    = math.max(0.0, math.min(1.0, (_mins - 570.0) / 390.0))
+    _rel    = _atr / _c
+    _relEma = ta.ema(_rel, 1000)
+    _span   = _hi20 - _lo20
+    _sspan  = _sesHi - _sesLo
+    _pchg   = math.sign(_c - _c[10])
+    _rchg   = math.sign(nz(_rsi) - nz(_rsi[10]))
+    _phv    = ta.pivothigh(high, 3, 3)
+    _plv    = ta.pivotlow(low, 3, 3)
+    var float _lastPH = na
+    var float _lastPL = na
+    _lastPH := na(_phv) ? _lastPH : _phv
+    _lastPL := na(_plv) ? _lastPL : _plv
+    var int _bos = 0
+    var int _bosAge = 0
+    _bosNew = not na(_lastPH) and _c > _lastPH ? 1 : (not na(_lastPL) and _c < _lastPL ? -1 : _bos)
+    _bosAge := _bosNew != _bos ? 0 : _bosAge + 1
+    _bos    := _bosNew
+    _o01 = math.max(-2.0, math.min(3.0, nz(_adx) / 25.0 - 1.0))
+    _o02 = math.max(-2.0, math.min(2.0, (nz(_adx) - nz(_adx[1])) / 25.0))
+    _o03 = float(_bos)
+    _o04 = math.max(0.0, math.min(1.0, (20.0 - _bosAge) / 20.0))
+    _o05 = (_adx >= 20 and _dip > _dim ? 1.0 : 0.0) - (_adx >= 20 and _dim > _dip ? 1.0 : 0.0)
+    _o06 = math.max(-0.5, math.min(0.5, (_span > 0 ? (_c - _lo20) / _span : 0.5) - 0.5))
+    _o07 = math.max(0.0, math.min(1.5, nz(_age) / 40.0))
+    _o08 = math.max(-8.0, math.min(8.0, nz((_c - _stLine) / _atrS)))
+    _o09 = (_c > _hi20 ? 1.0 : 0.0) - (_c < _lo20 ? 1.0 : 0.0)
+    _o10 = (_stDir < 0 ? 1.0 : 0.0) - (_stDir > 0 ? 1.0 : 0.0)
+    _o11 = math.max(-1.0, math.min(4.0, (na(_relEma) or _relEma <= 0 ? 1.0 : _rel / _relEma) - 1.0))
+    [_o01, _o02, _o03, _o04, _o05, _o06, _o07, _o08, _o09, _o10, _o11]
+
+// 16 series from the 3 rung -- only what the fitted model uses there.
+f_v48_f3(stFactor) =>
+    _c      = close
+    _atr    = ta.atr(14)
+    _atrS   = _atr > 0 ? _atr : na
+    _vwap   = ta.vwap(hlc3)
+    _ema9   = ta.ema(_c, 9)
+    [_dip, _dim, _adx] = ta.dmi(14, 14)
+    _osc    = ta.roc(_c, 9)
+    _rank   = ta.percentrank(_osc, 60)
+    _vsma   = ta.sma(volume, 20)
+    _vsma1  = _vsma[1]
+    _rvol   = _vsma1 > 0 ? volume / _vsma1 : 1.0
+    [_stLine, _stDir] = ta.supertrend(stFactor, 10)
+    _rsi    = ta.rsi(_c, 14)
+    _hh     = ta.highest(high, 20)
+    _ll     = ta.lowest(low, 20)
+    _hi20   = _hh[1]
+    _lo20   = _ll[1]
+    var float _sesHi = na
+    var float _sesLo = na
+    _newDay = ta.change(time("D")) != 0
+    _sesHi := _newDay or na(_sesHi) ? high : math.max(_sesHi, high)
+    _sesLo := _newDay or na(_sesLo) ? low : math.min(_sesLo, low)
+    _flip   = ta.change(_stDir) != 0
+    _age    = ta.barssince(_flip)
+    _anchor = ta.valuewhen(_flip, _c, 0)
+    _mins   = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+    _tod    = math.max(0.0, math.min(1.0, (_mins - 570.0) / 390.0))
+    _rel    = _atr / _c
+    _relEma = ta.ema(_rel, 1000)
+    _span   = _hi20 - _lo20
+    _sspan  = _sesHi - _sesLo
+    _pchg   = math.sign(_c - _c[10])
+    _rchg   = math.sign(nz(_rsi) - nz(_rsi[10]))
+    _phv    = ta.pivothigh(high, 3, 3)
+    _plv    = ta.pivotlow(low, 3, 3)
+    var float _lastPH = na
+    var float _lastPL = na
+    _lastPH := na(_phv) ? _lastPH : _phv
+    _lastPL := na(_plv) ? _lastPL : _plv
+    var int _bos = 0
+    var int _bosAge = 0
+    _bosNew = not na(_lastPH) and _c > _lastPH ? 1 : (not na(_lastPL) and _c < _lastPL ? -1 : _bos)
+    _bosAge := _bosNew != _bos ? 0 : _bosAge + 1
+    _bos    := _bosNew
+    _o01 = math.max(-2.0, math.min(3.0, nz(_adx) / 25.0 - 1.0))
+    _o02 = math.max(-2.0, math.min(2.0, (nz(_adx) - nz(_adx[1])) / 25.0))
+    _o03 = math.max(-2.0, math.min(3.0, nz(_dip) / 25.0 - 1.0))
+    _o04 = math.max(-2.0, math.min(2.0, ((nz(_dip) - nz(_dim)) - (nz(_dip[1]) - nz(_dim[1]))) / 25.0))
+    _o05 = math.max(0.0, math.min(8.0, nz((_hi20 - _c) / _atrS)))
+    _o06 = math.max(0.0, math.min(8.0, nz((_c - _lo20) / _atrS)))
+    _o07 = (_adx >= 20 and _dip > _dim ? 1.0 : 0.0) - (_adx >= 20 and _dim > _dip ? 1.0 : 0.0)
+    _o08 = math.max(-1.0, math.min(1.0, nz(_rank, 50.0) / 50.0 - 1.0))
+    _o09 = math.max(-0.5, math.min(0.5, (_span > 0 ? (_c - _lo20) / _span : 0.5) - 0.5))
+    _o10 = nz(_pchg - _rchg) / 2.0
+    _o11 = math.max(-0.5, math.min(0.5, (_sspan > 0 ? (_c - _sesLo) / _sspan : 0.5) - 0.5))
+    _o12 = math.max(0.0, math.min(1.5, nz(_age) / 40.0))
+    _o13 = math.max(-8.0, math.min(8.0, nz((_c - _anchor) / _atrS)))
+    _o14 = (_c > _hi20 ? 1.0 : 0.0) - (_c < _lo20 ? 1.0 : 0.0)
+    _o15 = (_stDir < 0 ? 1.0 : 0.0) - (_stDir > 0 ? 1.0 : 0.0)
+    _o16 = math.max(-1.0, math.min(4.0, (na(_relEma) or _relEma <= 0 ? 1.0 : _rel / _relEma) - 1.0))
+    [_o01, _o02, _o03, _o04, _o05, _o06, _o07, _o08, _o09, _o10, _o11, _o12, _o13, _o14, _o15, _o16]
+
+// ---------------------------------------------------------------- rungs
+[s0_adx_lvl, s0_bos, s0_bos_fresh, s0_di_spread, s0_st_dist, s0_st_ext, s0_supertrend, s0_vol_z, mom1, mom2, mom3, mom4, mom5, mom6, mom7, s0_rel] = request.security(standardTicker, "30S", f_v48_f0(3.0), lookahead=barmerge.lookahead_off, calc_bars_count=ENGINE_CALC_BARS)
+[s1_adx_lvl, s1_adx_slope, s1_bos, s1_bos_fresh, s1_dmi, s1_range_pos, s1_st_age, s1_st_dist, s1_structure, s1_supertrend, s1_vol_z] = request.security(standardTicker, "1", f_v48_f1(3.0), lookahead=barmerge.lookahead_off, calc_bars_count=ONE_MINUTE_CALC_BARS)
+[s3_adx_lvl, s3_adx_slope, s3_di_plus, s3_di_spread_slope, s3_dist_res, s3_dist_sup, s3_dmi, s3_osc_rank_c, s3_range_pos, s3_rsi_div, s3_sess_pos, s3_st_age, s3_st_ext, s3_structure, s3_supertrend, s3_vol_z] = request.security(standardTicker, "3", f_v48_f3(2.0), lookahead=barmerge.lookahead_off, calc_bars_count=THREE_MINUTE_CALC_BARS)
+
+// momentum basis and vol floor -- both taken from the 30s rung so all three panes
+// subtract the SAME component and gate on the SAME activity level the model was fit
+// under. Computing either on chart bars made the panes contradict each other.
+
+// ---------------------------------------------------------------- predicted edge, in bp
+// v53: the prediction is accumulated in TWO parts, because only one of them is entitled
+// to choose a side. See the v53 block below for the measurement that forced this.
+//   v53_signed -- features that flip sign when the chart is flipped vertically, plus the
+//                 momentum basis (also signed). This alone decides LONG vs SHORT.
+//   v53_blind  -- trend-STRENGTH and magnitude features: adx_slope, adx_lvl, st_age,
+//                 dist_res, dist_sup, vol_z. Real predictive content, no direction.
+// 20 signed + 8 blind + 7 momentum terms.
+float v53_signed = -0.2058560757
+v53_signed := v53_signed + (-0.9806719397) * nz(s3_dmi * s3_vol_z)
+v53_signed := v53_signed + (-2.7127464232) * nz(s3_structure * s3_vol_z)
+v53_signed := v53_signed + (-1.1277661878) * nz(s3_osc_rank_c * s3_vol_z)
+v53_signed := v53_signed + (2.6112201305) * nz(s3_di_spread_slope * s3_vol_z)
+v53_signed := v53_signed + (-2.3372592689) * nz(s3_range_pos * s3_vol_z)
+v53_signed := v53_signed + (0.1372464984) * nz(s1_st_dist * s1_vol_z)
+v53_signed := v53_signed + (-1.2000482530) * nz(s1_structure * s1_vol_z)
+v53_signed := v53_signed + (-0.7024584719) * nz(s3_structure)
+v53_signed := v53_signed + (-0.5915061793) * nz(s1_range_pos)
+v53_signed := v53_signed + (-0.5373001177) * nz(s3_rsi_div)
+v53_signed := v53_signed + (2.1690333812) * nz(s3_sess_pos * s3_vol_z)
+v53_signed := v53_signed + (0.1364293777) * nz(s1_supertrend * s1_vol_z)
+v53_signed := v53_signed + (-0.1305244062) * nz(s0_supertrend)
+v53_signed := v53_signed + (-0.0835547150) * nz(s0_st_dist)
+v53_signed := v53_signed + (1.2815404779) * nz(s0_di_spread)
+v53_signed := v53_signed + (-0.1637528080) * nz(s3_range_pos * s3_st_ext)
+v53_signed := v53_signed + (0.5957687897) * nz(s3_di_plus)
+v53_signed := v53_signed + (0.2598403819) * nz(s1_dmi * s1_vol_z)
+v53_signed := v53_signed + (-0.1067282882) * nz(s0_di_spread * s0_vol_z)
+v53_signed := v53_signed + (-0.0143516052) * nz(s0_st_ext * s0_vol_z)
+v53_signed := v53_signed + (0.0960732675) * nz(mom1)
+v53_signed := v53_signed + (0.0302115482) * nz(mom2)
+v53_signed := v53_signed + (0.0195417661) * nz(mom3)
+v53_signed := v53_signed + (0.0340817670) * nz(mom4)
+v53_signed := v53_signed + (-0.0032997790) * nz(mom5)
+v53_signed := v53_signed + (0.0137972592) * nz(mom6)
+v53_signed := v53_signed + (-1.3944635708) * nz(mom7)
+float v53_blind = 0.0
+v53_blind := v53_blind + (-17.1669843926) * nz(s3_adx_slope * s3_vol_z)
+v53_blind := v53_blind + (-0.7154063965) * nz(s3_st_age)
+v53_blind := v53_blind + (0.1238434653) * nz(s3_dist_res)
+v53_blind := v53_blind + (0.1744039553) * nz(s3_dist_sup)
+v53_blind := v53_blind + (0.4340665952) * nz(s3_vol_z)
+v53_blind := v53_blind + (-0.4624075960) * nz(s1_st_age)
+v53_blind := v53_blind + (-8.9022783577) * nz(s1_adx_slope * s1_vol_z)
+v53_blind := v53_blind + (-0.3564099373) * nz(s0_adx_lvl * s0_vol_z)
+
+// The full fitted prediction, kept intact so nothing that reads it changes meaning and
+// so a refit can still be checked against the research pipeline. It no longer picks the
+// side.
+float v48_pred = v53_signed + v53_blind
+
+// ------------------------------------------- map onto the existing 0-10 HUD scale
+//
+// v48-v53 gated the score on a hard threshold: score nothing unless
+// ATR14/close*1e4 >= the volatility floor the model was fitted under. MEASURED on his
+// live chart 2026-07-30 13:32 ET, IWM 30s standard candles: ATR 0.0589 at 291.41 =
+// [n] bp against a [n] bp floor -- [n]% of the level required. IWM would have to
+// more than DOUBLE its volatility before the HUD was allowed to say anything. On the
+// 2026 holdout that gate is open on only [n]% of bars, so the score was dark nearly
+// six bars in ten BY DESIGN. A read-out that is blank most of the time is useless.
+//
+// Lowering the threshold does not fix it -- at [n] bp even a [n] bp floor stays shut. Activity
+// gets the same treatment: it SCALES conviction continuously instead of switching the score off.
+//
+// diag_v53c_gate_cost.py measures what this costs. Removing the floor entirely raises
+// 2026-holdout coverage from [n]% to [n]% of bars. The script compares hit rate and IC
+// above and below the floor on DEV and on the holdout, and it reports where the two
+// disagree rather than hiding it. Those figures are redacted here.
+// The change was made so that the score is visible when the owner is actually
+// looking at it.
+//
+// TWO STATES THAT WERE PREVIOUSLY CONFLATED, and separating them is the other half of
+// the fix. `nz(s0_rel * 10000)` turned a FAILED 30s request into 0, which is below any
+// floor -- so genuine plumbing failure and a merely quiet tape both printed
+// 'DATA UNAVAILABLE' and were indistinguishable. Now:
+//   s0_rel is na      -> v48_active false -> score stays na -> honest DATA UNAVAILABLE
+//   s0_rel is a number-> score always shows, conviction scaled by how alive the tape is
+bool  v48_haveData = not na(s0_rel)
+float v48_relBp    = nz(s0_rel * 10000.0)
+// Linear in ATR/floor and capped at 1. Linear is the least-assumption shape: there is
+// no evidence for any particular curve, so no curve is invented. At the owner's [n] bp
+// reading this multiplier is 0.46, i.e. a raw 6 displays as ~2.8 -- visible, and
+// honestly quiet.
+float v48_actMult  = math.max(0.0, math.min(1.0, v48_relBp / 4.3519))
+bool  v48_active   = v48_haveData
+
+// MEASURED CAUSE (diag_v53_direction_blind.py, 581,767 dev bars). Not the largest
+// coefficient -- that reading was wrong. f3_adx_slope_x_vol has the biggest weight
+// ([n]) but only [n]% of the prediction's variance, because adx_slope is clamped and
+// small in practice. The real defect is aggregate:
+//   * direction-BLIND features carry [n]% of the prediction's variance
+//   * on [n]% of bars they FLIP the side the signed features alone would have given
+//   * the v52 side opposes a 2-of-3 trend consensus on [n]% of bars
+// A trend-STRENGTH derivative cannot say which way to bet, but v52 summed it in and read
+// the sign of the total as the side. A magnitude signal was choosing the direction.
+//
+// THE FIX IS A REWIRING, NOT A REFIT. Same features, same fitted weights, nothing
+// removed -- factors are added and the system is kept, applied to the read-out:
+//     side = sign(v53_signed);  size = |v53_signed|, damped when v53_blind opposes it
+// The blind features keep their real role: they scale conviction. When they argue against
+// the signed side, conviction falls instead of the side flipping.
+//
+// COST, measured against v52 by diag_v53b_signed_side.py. Figures are redacted here.
+//   DEV 2025:      excursion asymmetry, IC and hit rate
+//   HOLDOUT 2026:  the same three, on bars already used by v51/v52 for readability,
+//                  so NOT fresh
+//
+// This is not a performance claim.
+//
+// What changed is that the number no longer contradicts the chart for a reason that
+// cannot be defended.
+//
+// WHAT THIS DOES NOT FIX: the score is a MEAN-REVERSION model. Its signed features carry
+// negative fitted weights on range_pos, sess_pos, osc_rank_c and rsi_div, so it fades
+// extension by design and still opposes a trend consensus on [n]% of bars (down from
+// [n]%). That is a modelling choice, not a bug, and reversing it would be a different
+// model -- so it is left for the owner to decide rather than changed quietly here.
+float v53_dampF  = 0.50
+float v53_dir    = v53_signed * (math.sign(v53_blind) == math.sign(v53_signed) ? 1.0 : v53_dampF)
+
+//   * the old map returned min(pts, 3) below the toll, so a prediction of essentially
+//     zero displayed as 3 on one side and 0 on the other, then swapped 3/0 -> 0/3 the
+//     instant the sign changed, carrying no information. That single transition was
+//     [n]% of every change on screen, and it is exactly what the owner reported seeing.
+//   * floor() turned a sub-bp wiggle at the 3/4 boundary into a whole point ([n]%).
+// v50 -> v51: LONG<->SHORT flips [n]% -> [n]% of bars, >=2-point jumps [n]% ->
+// [n]%, mean jump [n] -> [n] points.
+// This is a readability change and not a performance claim.
+// The ACTIVITY GATE IS DELIBERATELY UNCHANGED: it causes only [n]% of transitions, and
+// loosening it would admit bars below the vol floor the model was fitted under.
+float v51_tfSec  = math.max(1.0, timeframe.in_seconds(timeframe.period) * 1.0)
+float v51_hlFast = math.max(1.0, 90.0 / v51_tfSec)
+float v51_hlSlow = math.max(1.0, 480.0 / v51_tfSec)
+float v51_aFast  = 1.0 - math.pow(0.5, 1.0 / v51_hlFast)
+float v51_aSlow  = 1.0 - math.pow(0.5, 1.0 / v51_hlSlow)
+bool  v51_newDay = ta.change(time("D")) != 0
+var float v51_fast = na
+var float v51_slow = na
+v51_fast := na(v53_dir) ? v51_fast : (v51_newDay or na(v51_fast) ? v53_dir : v51_fast + v51_aFast * (v53_dir - v51_fast))
+v51_slow := na(v53_dir) ? v51_slow : (v51_newDay or na(v51_slow) ? v53_dir : v51_slow + v51_aSlow * (v53_dir - v51_slow))
+
+// Two causes, two mechanisms. The first was a real bug and is fixed above: the score
+// rungs read syminfo.tickerid, which on a Heikin Ashi pane IS the HA ticker, so the 30s
+// pane scored synthetic averaged prices while the standard-candle panes scored real
+// ones. Same model, two different price series -- that alone can invert a pane.
+//
+// The second is structural and is what this block handles. Every pane re-evaluates the
+// model only on ITS OWN bar close, so a 3m pane is up to three minutes stale against a
+// 30s pane even when both are correct. Two fixes:
+//   * both half-lives are expressed in SECONDS, so all three panes smooth over the same
+//     wall-clock window and converge on the same view of the same signal.
+//   * a SLOW component is always mixed in, and when fast and slow disagree in sign the
+//     magnitude is damped. Confident opposite readings on two panes then cannot happen
+//     by construction -- disagreement lowers conviction instead of producing a
+//     confident number in each direction. That is the weighting factor the owner described:
+//     the slower, higher-timeframe view always has a vote in the faster pane's number.
+float v51_blend  = 0.55 * v51_fast + 0.45 * v51_slow
+
+// He was right and this was the cause. v51-v56 damped on a SIGN TEST:
+//     sign(fast) == sign(slow) ? 1.0 : 0.35
+// which is a cliff exactly where the two cross. Measured on the 2026 holdout
+// (diag_v57_display_range.py): the multiplier changed state on [n]% of scored bars,
+// and each change moved the displayed number by [n]x in a single bar. That is the
+// same binary shape v54 removed from the activity gate and v56 refused for trend; it
+// was the last one left in the chain.
+//
+// The replacement damps in PROPORTION to how strongly the two disagree. Note what it
+// deliberately does NOT do: the obvious min/max ratio would also damp bars where fast
+// and slow AGREE but differ in size, which is not disagreement and must not be
+// penalised. Only the opposed part counts, so aligned bars are untouched at any
+// magnitude. As the slower leg passes through zero the damping falls to zero with it,
+// which is what makes the crossing continuous.
+float v51_den    = math.max(v51_fast * v51_fast, v51_slow * v51_slow)
+float v51_opp    = v51_den > 0 ? math.max(0.0, -v51_fast * v51_slow) / v51_den : 0.0
+float v51_coh    = na(v51_fast) or na(v51_slow) ? 1.0 : 1.0 - 0.65 * math.min(1.0, math.max(0.0, v51_opp))
+float v51_sm     = v51_blend * v51_coh
+
+// WHAT THIS IS NOT. He also chose a REGIME SPLIT (trend-follow in a trend, fade otherwise). That
+// was measured first and REJECTED -- diag_v56_trend_regime.py, DEV 2025, [n] bars, out of
+// fold. It failed all three pre-registered criteria: the ordered buckets are non-monotone
+// (|consensus| = 2 is the only good one, which is the exact single-strong-middle-bucket
+// signature that killed the balance/imbalance split in b1 -> b2), the fold sign did not
+// hold, and the largest |eff t| anywhere in the sweep was [n] against a bar of 2.0. So the side
+// is NOT conditioned on regime.
+//
+// WHY IT IS WORTH DOING ANYWAY. On the same run, [n]% of the score's HARD calls
+// (>= 7 points) were taken directly against a strong 1m trend: [n] hard shorts under a
+// strong 1m uptrend and [n] hard longs under a strong 1m downtrend, out of [n] hard
+// calls. That is a COHERENCE defect and it is exactly what the owner kept reporting. It is
+// not a performance claim.
+//
+// THE TWO REQUIREMENTS PULL OPPOSITE WAYS, so the 1m weighs more than twice the 3m:
+//   MUST STAY LEGAL    -- fading the 30s against a 3m trend ([n]% of scored bars do).
+//   MUST BE IMPOSSIBLE -- a hard 30s short under a strong 1m uptrend.
+// Points are capped at 10, so 10 * (1 - 0.35) = 6.50 < 7 makes the second unreachable BY
+// CONSTRUCTION, not by tuning. The 3m at full opposition still allows 8.5 -- clearly
+// allowed, just quieter. Both maximally opposed still leaves 5.0: damped, not flipped.
+//
+// The trend read is the same 3-vote consensus the HUD's TREND row shows, and it is
+// GRADED: 3 of 3 agreeing damps three times as hard as 1 of 3. adx_lvl is ADX/25 - 1,
+// so the strength ramp is nothing at ADX 15, full weight by ADX 25, sliding
+// continuously between. No cliff anywhere for the score to snap across.
+float v56_t1   = (nz(s1_supertrend) + nz(s1_dmi) + nz(s1_structure)) / 3.0
+float v56_t3   = (nz(s3_supertrend) + nz(s3_dmi) + nz(s3_structure)) / 3.0
+float v56_s1   = math.max(0.0, math.min(1.0, (nz(s1_adx_lvl) - (-0.40)) / 0.40))
+float v56_s3   = math.max(0.0, math.min(1.0, (nz(s3_adx_lvl) - (-0.40)) / 0.40))
+// The side is read from v51_sm and is never written back to. A multiplier that is
+// always > 0 cannot change a sign, which is what keeps this a weight and not a flip.
+float v56_side = math.sign(nz(v51_sm))
+float v56_opp1 = math.max(0.0, -v56_side * v56_t1)
+float v56_opp3 = math.max(0.0, -v56_side * v56_t3)
+float v56_damp = math.max(0.0, 1.0 - 0.35 * v56_opp1 * v56_s1 - 0.15 * v56_opp3 * v56_s3)
+
+// ---- v58: DO NOT FADE A FRESHLY BROKEN STRUCTURE -------------------------------
+// Measured on TradingView replay, IWM 2026-07-29, five blind calls written to the
+// ledger BEFORE stepping. The score fades extension by construction, and two bars ten
+// minutes apart show exactly when that is right and when it is ruinous:
+//
+//   09:59:30  fresh impulse, tight consolidation, structure NOT yet broken
+//             score LONG 0.6 -> price bounced [n] bp. The fade was CORRECT, and it
+//             stopped out the open short.
+//   10:09:30  the bounce had already been attempted and FAILED, price made a lower low
+//             score LONG 3.8 -> price fell a further [n] bp with [n] bp of adverse
+//             excursion. Ruinous, and the worst call of the run.
+//
+// Trend, volatility and volume do NOT separate those two bars -- v54 and v56 already
+// read all three. What separates them is whether structure has already broken against
+// the fade. Break of Structure was also, independently, the strongest of the three
+// structural features in the setup research, so this is not a one-bar story.
+//
+// The reference level comes from ta.pivothigh(high,3,3), which returns a value only
+// three bars AFTER the pivot -- so the level is knowable at the bar it is used on. The
+// lag IS the causality here and must not be tuned away.
+//
+// FRESHNESS is the whole point: an old break is already priced and damps nothing, a
+// new one nearly silences a fade. Still a weight and never a flip -- the multiplier is
+// floored at 0, so it cannot change a sign.
+float v58_bos   = nz(s0_bos)
+float v58_fresh = nz(s0_bos_fresh)
+float v58_bos1  = nz(s1_bos)
+float v58_frsh1 = nz(s1_bos_fresh)
+float v58_side  = math.sign(nz(v51_sm))
+// Opposition on the execution rung and on the 1m; the STRONGER of the two governs, so
+// a break on either timeframe is enough to quiet a fade against it.
+float v58_opp0  = math.max(0.0, -v58_side * v58_bos) * v58_fresh
+float v58_opp1  = math.max(0.0, -v58_side * v58_bos1) * v58_frsh1
+float v58_opp   = math.max(v58_opp0, v58_opp1)
+float v58_damp  = math.max(0.0, 1.0 - 0.70 * v58_opp)
+
+// Measured on the 2026 holdout, [n] scored bars:
+//   [n]% of bars scored under 5. p50 [n], p90 [n]. A 7 appeared on [n]% of bars
+//   and a 9 on [n]% of bars.
+// The cause was the old two-leg map: 4 points inside one toll (25.1 points per bp) and
+// then 1 point per [n] bp above it (1.8 points per bp), a 13.8x slope collapse at the
+// join. Everything interesting lived on the flat leg and never climbed.
+//
+// This is a single saturating curve: monotone, onto [0,10), and with NO KINK anywhere,
+// so there is no breakpoint left for the display to snap across. One free parameter,
+// solved by calib_v57_hud.py so the displayed p90 lands on 7.
+//
+// AFTER, same window: p50 [n], p90 [n], p99 [n], >=7 on [n]% of bars and >=9 on
+// [n]%. Bar-to-bar jumps of >=2 points FELL from [n]% to [n]% even though the
+// range in use roughly doubled.
+//
+// WHAT THIS DOES NOT DO. A monotone remap cannot change which side is shown and cannot
+// change the hit rate, which measured identical before and after. ">= 7" now
+// means "top [n]% conviction bar for this score", NOT "likely to be right".
+// This is a legibility change.
+float v51_ap  = math.abs(v51_sm)
+float v51_pts = 10.0 * (1.0 - math.exp(-v51_ap / 0.435893))
+// v54: activity scales the conviction rather than switching it off.
+// v56: an opposing higher-timeframe trend scales it too. Both are multipliers on the
+// POINTS rather than on v51_sm, because the points are what carry the 10-cap that makes
+// the 'no hard call against a strong 1m' guarantee provable.
+// v58: a fresh opposing break of structure damps too.
+v51_pts := v48_active ? v51_pts * v48_actMult * v56_damp * v58_damp : 0.0
+
+// Floats drive the HUD readout. The rounded ints drive callCode and the trade
+// lifecycle, which are threshold comparisons that never wanted a fractional value.
+float v48_longF  = na(v51_sm) or not v48_active ? float(na) : (v51_sm > 0 ? v51_pts : 0.0)
+float v48_shortF = na(v51_sm) or not v48_active ? float(na) : (v51_sm < 0 ? v51_pts : 0.0)
+int v48_long  = na(v48_longF)  ? int(na) : int(math.round(v48_longF))
+int v48_short = na(v48_shortF) ? int(na) : int(math.round(v48_shortF))
+// ================= END LANE A v62 SCORE =========================================
+
+// The score below is the fitted model's output. v47's hand-weighted blend of the rungs is
+// gone; the rungs themselves remain because the HUD still reports them as DRIVERS.
+// The ints feed callCode and the trade lifecycle (threshold comparisons); the floats feed
+// the HUD readout, so the number the owner reads moves continuously instead of in whole steps.
+int longScore  = v48_long
+int shortScore = v48_short
+float longScoreF  = v48_longF
+float shortScoreF = v48_shortF
+
+// These arrows are driven by THE SCORE, i.e. by the rule that was tested
+// on the Strategy Tester (entry >= 8.5, exit < 4.0, on IWM, QQQ and SPY).
+// What is drawn is now the same rule that was measured, so the chart and the backtest agree.
+//
+// Both thresholds are INPUTS. The owner uses the score as a second confirmation across its whole
+// range, so he can lower the arrow threshold to see more without touching the score itself.
+// The APB-1 machine is left alone -- it still drives the SETUP row and the trade lifecycle.
+bool  v60_show     = input.bool(true, "Show score signal arrows", group="Signal arrows")
+float v60_entryThr = input.float(8.5, "Arrow: entry score (>=)", minval=1.0, maxval=10.0, step=0.1, group="Signal arrows")
+float v60_exitThr  = input.float(4.0, "Arrow: exit score (<)", minval=0.0, maxval=10.0, step=0.1, group="Signal arrows")
+var int v60_state = 0
+int   v60_prev     = v60_state
+bool  v60_longFire = nz(longScoreF)  >= v60_entryThr
+bool  v60_shortFire= nz(shortScoreF) >= v60_entryThr
+bool  v60_flat     = nz(longScoreF) < v60_exitThr and nz(shortScoreF) < v60_exitThr
+v60_state := v60_longFire ? 1 : v60_shortFire ? -1 : (v60_flat ? 0 : v60_state)
+bool v60_newLong  = v60_show and v60_state ==  1 and v60_prev !=  1
+bool v60_newShort = v60_show and v60_state == -1 and v60_prev != -1
+// v61: the exit marker is SPLIT BY SIDE and colour-matched to the entry it closes, because
+// one orange cross for both cases did not say WHICH position it was closing. Green always
+// means the long leg, red always means the short leg -- entry and exit share a colour, so a
+// green triangle is always answered by a green ring.
+//
+//   * ABOVE, because the relative-volume dots live BELOW the bar. An exit marker below the
+//     candle sat in the same lane as those dots and was easy to misread.
+//   * A RING rather than a filled dot, for the same reason -- the rvol dots are solid, so a
+//     solid exit marker reads as one of them at a glance.
+// Pine has no hollow-circle SHAPE (shape.circle is always filled), so the ring is drawn with
+// plotchar and the U+25CB WHITE CIRCLE glyph. That is the only way to get an unfilled ring.
+bool v60_exitLong  = v60_show and v60_state == 0 and v60_prev ==  1
+bool v60_exitShort = v60_show and v60_state == 0 and v60_prev == -1
+plotshape(v60_newLong,   "Long entry",  style=shape.triangleup,   location=location.belowbar, color=color.rgb(76, 220, 145), size=size.small)
+plotshape(v60_newShort,  "Short entry", style=shape.triangledown, location=location.abovebar, color=color.rgb(255, 112, 128), size=size.small)
+plotchar(v60_exitLong,   "Exit long",   "○", location.abovebar, color=color.rgb(76, 220, 145), size=size.tiny)
+plotchar(v60_exitShort,  "Exit short",  "○", location.abovebar, color=color.rgb(255, 112, 128), size=size.tiny)
+int scoreSpread = na(longScore) or na(shortScore) ? int(na) : longScore - shortScore
+int callCode = na(scoreSpread) ? int(na) : nz(longScoreF) < 4.0 and nz(shortScoreF) < 4.0 ? 0 : math.abs(scoreSpread) < 2 ? 1 : scoreSpread >= 2 and nz(longScoreF) >= 4.0 ? (nz(longScoreF) >= 8.5 ? 4 : 2) : scoreSpread <= -2 and nz(shortScoreF) >= 4.0 ? (nz(shortScoreF) >= 8.5 ? 5 : 3) : 0
+
+// Chart-native session structure. The daily request is a higher timeframe from
+// every supported pane, and the opening range is accumulated from this pane's own
+// bars, so both survive Bar Replay where the 30s engine's copies did not.
+[dailyPriorHigh, dailyPriorLow, dailyPriorClose] = request.security(
+     standardTicker,
+     "D",
+     [high[1], low[1], close[1]],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on,
+     calc_bars_count=DAILY_CALC_BARS
+)
+var float sessionOpeningHigh = na
+var float sessionOpeningLow = na
+bool chartInRth = session.ismarket
+bool chartStartsRth = chartInRth and (timeframe.change("1D") or not session.ismarket[1])
+if chartStartsRth
+    sessionOpeningHigh := na
+    sessionOpeningLow := na
+int chartClockSeconds = hour(time, TZ) * 3600 + minute(time, TZ) * 60
+if chartInRth and chartClockSeconds >= 9 * 3600 + 30 * 60 and chartClockSeconds < 9 * 3600 + 45 * 60
+    sessionOpeningHigh := na(sessionOpeningHigh) ? high : math.max(sessionOpeningHigh, high)
+    sessionOpeningLow := na(sessionOpeningLow) ? low : math.min(sessionOpeningLow, low)
+
+[nearestSupport, supportCode, nearestResistance, resistanceCode] = f_nearest_levels(close, dailyPriorHigh, dailyPriorLow, dailyPriorClose, sessionOpeningHigh, sessionOpeningLow)
+
+// The score's freshness is the chart's own last bar, so AS OF stays truthful at
+// any Replay cursor instead of reporting when the 30s engine last had data.
+int scoreAsOf = time_close
+
+// EMA9 is a 1-minute timing tool only. It renders solely on the 1m pane, from
+// that pane's own standard candles. The 3m and 30s panes no longer plot it; the
+// score still uses EMA9 internally on every timeframe regardless of display.
+// Heikin-Ashi candles derived from this chart's own standard bars. Exact - the same
+// transform TradingView applies for the Heikin-Ashi chart type - but the underlying
+// series stays standard, so every calculation above still sees real prices.
+float haClose = (open + high + low + close) / 4
+var float haOpen = na
+haOpen := na(haOpen[1]) ? (open + close) / 2 : (haOpen[1] + haClose[1]) / 2
+float haHigh = math.max(high, math.max(haOpen, haClose))
+float haLow = math.min(low, math.min(haOpen, haClose))
+bool drawHeikinAshi = displayContractMatches and showHeikinAshi and chart.is_standard
+color haBodyColor = haClose >= haOpen ? color.rgb(38, 166, 154) : color.rgb(239, 83, 80)
+plotcandle(drawHeikinAshi ? haOpen : na, drawHeikinAshi ? haHigh : na, drawHeikinAshi ? haLow : na, drawHeikinAshi ? haClose : na, title="Heikin-Ashi", color=haBodyColor, wickcolor=haBodyColor, bordercolor=haBodyColor)
+
+plot(displayContractMatches and isOneMinute ? ownEma9 : na, "EMA 9", color=color.rgb(243, 178, 69), linewidth=2)
+plot(displayContractMatches and isThirtySecond ? sessionVwap : na, "30s Standard VWAP", color=color.rgb(21, 101, 192), linewidth=2)
+plot(displayContractMatches and isThirtySecond ? sessionVwapUpper : na, "30s VWAP +2σ", color=color.rgb(250, 224, 46), linewidth=1)
+plot(displayContractMatches and isThirtySecond ? sessionVwapLower : na, "30s VWAP −2σ", color=color.rgb(250, 224, 46), linewidth=1)
+
+// Relative-volume participation dots. Each bar's volume is compared to the
+// simple average of the prior bars' volume on the SAME chart timeframe, so the
+// ratio and threshold are fully visible in the inputs and nothing is hidden. A dot
+// marks unusual participation. Its COLOR is only the candle's own direction
+// (up = green, down = red, doji = gray); it is NOT real buyer-versus-seller
+// volume, which intraday feeds do not provide. Default marks only the first bar of
+// each surge to stay uncluttered; switch the input to mark every qualifying bar.
+// Volume on a Heikin-Ashi chart is the real traded volume, so no separate
+// standard-price request is needed.
+bool rvolQualifies = not na(rvolRatio) and rvolRatio >= rvolMarkFloor
+bool rvolPriorQualifies = not na(rvolRatio[1]) and rvolRatio[1] >= rvolMarkFloor
+bool rvolFires = displayContractMatches and showRvolMarks and rvolQualifies and (not rvolFirstOnly or not rvolPriorQualifies)
+color rvolDotColor = close > open ? color.rgb(76, 220, 145) : close < open ? color.rgb(255, 112, 128) : color.new(color.gray, 10)
+plotshape(rvolFires, "Relative volume surge", style=shape.circle, location=location.belowbar, color=rvolDotColor, size=size.tiny)
+
+f_state_text(int state) =>
+    state == STATE_ARMED ? "ENTRY READY" : state == STATE_TRIGGERED ? "IN TRADE" : state == STATE_T1 ? "TP1 HIT | HALF OPEN" : state == STATE_TARGET_2 ? "TP2 HIT | CLOSED" : state == STATE_STOPPED ? "STOPPED | CLOSED" : state == STATE_INVALIDATED ? "CANCELED | BAD OPEN" : state == STATE_EXPIRED ? "MISSED ENTRY" : state == STATE_TIME_EXIT ? "TIME EXIT | CLOSED" : "WAIT"
+
+// callCode: 0 wait/low, 1 wait/mixed, 2 watch long, 3 watch short, 4 long, 5 short.
+f_call_text(int code) =>
+    code == 2 ? "WATCH LONG" : code == 3 ? "WATCH SHORT" : code == 4 ? "LONG" : code == 5 ? "SHORT" : code == 1 ? "WAIT | MIXED" : "WAIT"
+
+// Action read that sits beside the state: tells the owner what to do now whether or not
+// he is already in. A live mechanical position drives hold/trim/sell; otherwise the
+// directional CALL drives good-entry / watch / wait.
+f_action_text(int state, int code) =>
+    state == STATE_ARMED ? "STILL A GOOD ENTRY" : state == STATE_TRIGGERED ? "HOLDING" : state == STATE_T1 ? "TRIM — HOLD REST" : state == STATE_TARGET_2 ? "SELL — TARGET HIT" : state == STATE_STOPPED ? "OUT — STOPPED" : state == STATE_TIME_EXIT ? "SELL — TIME EXIT" : state == STATE_INVALIDATED or state == STATE_EXPIRED ? "STAND DOWN" : code == 4 or code == 5 ? "GOOD ENTRY" : code == 2 or code == 3 ? "WATCH" : "WAIT"
+
+f_direction_word(int direction) =>
+    direction == 1 ? "UP" : direction == -1 ? "DOWN" : "FLAT"
+
+// Plain-language ladder read. Every pane names all three rungs, slowest first, so
+// "3m UP · 1m UP · 30s DOWN" shows at a glance why the score is not a clean 10 -
+// and a rung that could not report shows an em dash rather than a fake direction.
+f_ladder_text(int threeDir, bool threeFresh, int oneDir, bool oneFresh, int thirtyDir, bool thirtyFresh, bool ready) =>
+    not ready ? "—" : "3m " + (threeFresh ? f_direction_word(threeDir) : "—") + " · 1m " + (oneFresh ? f_direction_word(oneDir) : "—") + " · 30s " + (thirtyFresh ? f_direction_word(thirtyDir) : "—")
+
+f_vote_mark(int longVote, int shortVote) =>
+    longVote > shortVote ? "▲" : shortVote > longVote ? "▼" : "·"
+
+f_level_text(int code) =>
+    code == LEVEL_PDH ? "PDH" : code == LEVEL_PDL ? "PDL" : code == LEVEL_PDC ? "PDC" : code == LEVEL_ORH ? "ORH" : code == LEVEL_ORL ? "ORL" : ""
+
+f_setup_text(int stage) =>
+    stage == 1 ? "BREAKOUT PASSED | WAIT PULLBACK" : stage == 2 ? "PULLBACK PASSED | WAIT 1m" : stage == 3 ? "ENTRY READY | NEXT 1m OPEN" : stage == -2 ? "HISTORY UNAVAILABLE" : stage == -1 ? "NO TRADE | FIRST BREAK FAILED" : "WAITING FOR SETUP"
+
+// Optional sample position, off by default. It reuses the exact plan-driven
+// drawing path so the real red-risk / green-reward geometry is visible on
+// today's chart or in Replay without waiting for a live setup. It is never a
+// real trade: it activates only when no genuine plan exists, is anchored to the
+// standard-price session VWAP so all three panes draw identical levels, and is
+// labeled DEMO both on the entry marker and in the HUD header.
+// Anchor the sample to the most recent bar only. The shared drawing path fixes
+// a plan's left edge and prices at creation (correct for a real, frozen plan),
+// so the demo must resolve on the last bar to sit at current price and time
+// instead of the first historical bar with no live plan. Replay re-anchors it
+// at each stepped bar; a cold reload rebuilds it at the newest bar.
+bool demoActive = displayContractMatches and showDemoPosition and barstate.islast and (na(planId) or planId == 0)
+if demoActive
+    int demoAnchor = not na(scoreAsOf) ? scoreAsOf : time
+    float demoBase = not na(ownVwap) ? ownVwap : close
+    float demoRisk = demoBase * 0.0015
+    planId := -1
+    planSide := 1
+    lifecycle := STATE_TRIGGERED
+    entryTime := demoAnchor - 12 * MINUTE_MS
+    entryPrice := demoBase
+    stopPrice := demoBase - demoRisk
+    target1Price := demoBase + TARGET_1_R * demoRisk
+    target2Price := demoBase + TARGET_2_R * demoRisk
+    target1Hit := false
+    holdDeadline := entryTime + HOLD_WINDOW_MS
+    terminalTime := na
+
+bool terminalPlan = lifecycle == STATE_TARGET_2 or lifecycle == STATE_STOPPED or lifecycle == STATE_INVALIDATED or lifecycle == STATE_EXPIRED or lifecycle == STATE_TIME_EXIT
+bool hasEntry = planId != 0 and lifecycle != STATE_INVALIDATED and lifecycle != STATE_EXPIRED and not na(entryTime) and not na(entryPrice) and not na(stopPrice) and not na(target1Price) and not na(target2Price)
+int planRightTime = terminalPlan and not na(terminalTime) ? terminalTime : not na(holdDeadline) ? holdDeadline : not na(entryDeadline) ? entryDeadline : scoreAsOf + MINUTE_MS
+bool showGeometry = displayContractMatches and hasEntry and (isThirtySecond or showPlanOnContext)
+int zoneTransparency = isThirtySecond ? 82 : 90
+
+var int drawnPlanId = 0
+var int archivedPlanId = 0
+var line entryLine = na
+var line stopLine = na
+var line target1Line = na
+var line target2Line = na
+var box riskBox = na
+var box rewardBox = na
+var label entryMarker = na
+var array<line> archivedEntryLines = array.new_line()
+var array<line> archivedStopLines = array.new_line()
+var array<line> archivedTarget1Lines = array.new_line()
+var array<line> archivedTarget2Lines = array.new_line()
+var array<box> archivedRiskBoxes = array.new_box()
+var array<box> archivedRewardBoxes = array.new_box()
+var array<label> archivedEntryMarkers = array.new_label()
+
+bool showActiveGeometry = showGeometry and not (terminalPlan and planId == archivedPlanId)
+
+if planId != drawnPlanId or not showActiveGeometry
+    if not na(entryLine)
+        line.delete(entryLine)
+        entryLine := na
+    if not na(stopLine)
+        line.delete(stopLine)
+        stopLine := na
+    if not na(target1Line)
+        line.delete(target1Line)
+        target1Line := na
+    if not na(target2Line)
+        line.delete(target2Line)
+        target2Line := na
+    if not na(riskBox)
+        box.delete(riskBox)
+        riskBox := na
+    if not na(rewardBox)
+        box.delete(rewardBox)
+        rewardBox := na
+    if not na(entryMarker)
+        label.delete(entryMarker)
+        entryMarker := na
+    drawnPlanId := showActiveGeometry ? planId : 0
+
+if showActiveGeometry
+    float riskTop = math.max(entryPrice, stopPrice)
+    float riskBottom = math.min(entryPrice, stopPrice)
+    float rewardTop = math.max(entryPrice, target2Price)
+    float rewardBottom = math.min(entryPrice, target2Price)
+    if na(riskBox)
+        riskBox := box.new(left=entryTime, top=riskTop, right=planRightTime, bottom=riskBottom, xloc=xloc.bar_time, border_color=color.new(color.rgb(239, 83, 100), 15), bgcolor=color.new(color.rgb(239, 83, 100), zoneTransparency))
+        rewardBox := box.new(left=entryTime, top=rewardTop, right=planRightTime, bottom=rewardBottom, xloc=xloc.bar_time, border_color=color.new(color.rgb(53, 196, 125), 15), bgcolor=color.new(color.rgb(53, 196, 125), zoneTransparency))
+        entryLine := line.new(entryTime, entryPrice, planRightTime, entryPrice, xloc=xloc.bar_time, color=color.white, width=2)
+        stopLine := line.new(entryTime, stopPrice, planRightTime, stopPrice, xloc=xloc.bar_time, color=color.rgb(239, 83, 100), width=2)
+        target2Line := line.new(entryTime, target2Price, planRightTime, target2Price, xloc=xloc.bar_time, color=color.rgb(53, 196, 125), width=2)
+        if showTarget1
+            target1Line := line.new(entryTime, target1Price, planRightTime, target1Price, xloc=xloc.bar_time, color=color.new(color.rgb(53, 196, 125), 10), width=1, style=line.style_dashed)
+        string markerText = (demoActive ? "DEMO — SAMPLE\n" : "") + (planSide == 1 ? "LONG ENTRY" : "SHORT ENTRY") + "\n" + str.format_time(entryTime, "HH:mm:ss", TZ) + " ET\n" + (demoActive ? "NOT A REAL TRADE" : f_state_text(lifecycle))
+        entryMarker := label.new(entryTime, entryPrice, markerText, xloc=xloc.bar_time, yloc=yloc.price, style=planSide == 1 ? label.style_label_up : label.style_label_down, textcolor=color.white, color=planSide == 1 ? color.rgb(31, 142, 89) : color.rgb(187, 54, 70), size=size.tiny)
+    else
+        box.set_right(riskBox, planRightTime)
+        box.set_right(rewardBox, planRightTime)
+        line.set_x2(entryLine, planRightTime)
+        line.set_x2(stopLine, planRightTime)
+        line.set_x2(target2Line, planRightTime)
+        if not na(target1Line)
+            line.set_x2(target1Line, planRightTime)
+        label.set_text(entryMarker, (demoActive ? "DEMO — SAMPLE\n" : "") + (planSide == 1 ? "LONG ENTRY" : "SHORT ENTRY") + "\n" + str.format_time(entryTime, "HH:mm:ss", TZ) + " ET\n" + (demoActive ? "NOT A REAL TRADE" : f_state_text(lifecycle)))
+
+// Completed positions remain on the chart like TradingView's Long/Short
+// Position drawings. Keep the newest N and prune only the oldest complete set.
+if showActiveGeometry and terminalPlan and planId != archivedPlanId and not na(riskBox)
+    array.push(archivedEntryLines, entryLine)
+    array.push(archivedStopLines, stopLine)
+    array.push(archivedTarget1Lines, target1Line)
+    array.push(archivedTarget2Lines, target2Line)
+    array.push(archivedRiskBoxes, riskBox)
+    array.push(archivedRewardBoxes, rewardBox)
+    array.push(archivedEntryMarkers, entryMarker)
+    archivedPlanId := planId
+    drawnPlanId := 0
+    entryLine := na
+    stopLine := na
+    target1Line := na
+    target2Line := na
+    riskBox := na
+    rewardBox := na
+    entryMarker := na
+    if array.size(archivedRiskBoxes) > completedTradesToKeep
+        line oldEntryLine = array.shift(archivedEntryLines)
+        line oldStopLine = array.shift(archivedStopLines)
+        line oldTarget1Line = array.shift(archivedTarget1Lines)
+        line oldTarget2Line = array.shift(archivedTarget2Lines)
+        box oldRiskBox = array.shift(archivedRiskBoxes)
+        box oldRewardBox = array.shift(archivedRewardBoxes)
+        label oldEntryMarker = array.shift(archivedEntryMarkers)
+        if not na(oldEntryLine)
+            line.delete(oldEntryLine)
+        if not na(oldStopLine)
+            line.delete(oldStopLine)
+        if not na(oldTarget1Line)
+            line.delete(oldTarget1Line)
+        if not na(oldTarget2Line)
+            line.delete(oldTarget2Line)
+        if not na(oldRiskBox)
+            box.delete(oldRiskBox)
+        if not na(oldRewardBox)
+            box.delete(oldRewardBox)
+        if not na(oldEntryMarker)
+            label.delete(oldEntryMarker)
+
+var line supportLine = na
+var line resistanceLine = na
+var label supportLabel = na
+var label resistanceLabel = na
+if barstate.islast
+    if not na(supportLine)
+        line.delete(supportLine)
+        supportLine := na
+    if not na(resistanceLine)
+        line.delete(resistanceLine)
+        resistanceLine := na
+    if not na(supportLabel)
+        label.delete(supportLabel)
+        supportLabel := na
+    if not na(resistanceLabel)
+        label.delete(resistanceLabel)
+        resistanceLabel := na
+    if displayContractMatches and isThreeMinute and showStructure and not na(scoreAsOf)
+        int sessionStart = timestamp(TZ, year(scoreAsOf, TZ), month(scoreAsOf, TZ), dayofmonth(scoreAsOf, TZ), 9, 30)
+        // Draw the two nearest session levels as clean full-session horizontal
+        // lines (open through a little past the last bar) so they read as levels
+        // rather than the short faint stubs the old 12-minute window produced.
+        int levelStart = sessionStart
+        int levelEnd = scoreAsOf + 30 * MINUTE_MS
+        if not na(nearestSupport)
+            supportLine := line.new(levelStart, nearestSupport, levelEnd, nearestSupport, xloc=xloc.bar_time, color=color.new(color.silver, 0), width=1, style=line.style_dashed)
+            supportLabel := label.new(levelEnd, nearestSupport, "S | " + f_level_text(supportCode) + " " + str.tostring(nearestSupport, format.mintick), xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_left, textcolor=color.white, color=color.new(color.rgb(45, 55, 65), 5), size=size.tiny)
+        if not na(nearestResistance)
+            resistanceLine := line.new(levelStart, nearestResistance, levelEnd, nearestResistance, xloc=xloc.bar_time, color=color.new(color.silver, 0), width=1, style=line.style_dashed)
+            resistanceLabel := label.new(levelEnd, nearestResistance, "R | " + f_level_text(resistanceCode) + " " + str.tostring(nearestResistance, format.mintick), xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_left, textcolor=color.white, color=color.new(color.rgb(45, 55, 65), 5), size=size.tiny)
+
+bool livePosition = lifecycle == STATE_TRIGGERED or lifecycle == STATE_T1
+color callHeaderColor = callCode == 4 or callCode == 2 ? color.rgb(27, 126, 83) : callCode == 5 or callCode == 3 ? color.rgb(150, 45, 58) : color.rgb(29, 67, 96)
+color headerColor = demoActive ? color.rgb(122, 87, 168) : not displayContractMatches ? color.rgb(184, 48, 65) : livePosition ? color.rgb(27, 126, 83) : terminalPlan ? color.rgb(63, 72, 82) : callHeaderColor
+var table hud = table.new(position.top_right, 2, 9, bgcolor=color.new(color.rgb(8, 15, 23), 8), frame_color=color.new(color.white, 72), frame_width=1)
+if barstate.islast
+    bool contractLive = displayContractMatches and not demoActive
+    // The score is chart-native, so it warms up with the chart itself rather than
+    // depending on the 30s engine. If it still cannot be formed - too little
+    // history at this Replay endpoint - say so plainly instead of printing NaN.
+    bool scoreReady = not na(longScore) and not na(shortScore)
+    // Header carries a live mechanical position state when one is active, and the
+    // continuous directional CALL otherwise. Contract warnings still take priority.
+    string headerState = demoActive ? "DEMO POSITION — SAMPLE" : not isSupportedSymbol ? "USE SPY / QQQ / IWM" : not isSupportedTimeframe ? "USE 3m / 1m / 30s" : not chartStyleMatches ? "USE STANDARD CANDLES" : not scoreReady ? "DATA UNAVAILABLE" : livePosition ? f_state_text(lifecycle) : f_call_text(callCode)
+    // Row 0 - pane header + CALL
+    table.cell(hud, 0, 0, "LANE A | " + syminfo.ticker + " | " + paneName, text_color=color.white, text_size=size.small, bgcolor=headerColor)
+    table.cell(hud, 1, 0, headerState, text_color=color.white, text_size=size.small, bgcolor=headerColor)
+    // Row 1 - dynamic LONG 0-10 / SHORT 0-10 directional score (independent tallies)
+    color scoreColor = not contractLive ? color.white : callCode == 4 or callCode == 2 ? color.rgb(76, 220, 145) : callCode == 5 or callCode == 3 ? color.rgb(255, 112, 128) : color.white
+    string scoreText = not contractLive ? "--" : not scoreReady ? "— no data" : str.tostring(longScoreF, "#.0") + " / " + str.tostring(shortScoreF, "#.0")
+    table.cell(hud, 0, 1, "LONG / SHORT", text_color=color.silver, text_size=size.tiny)
+    table.cell(hud, 1, 1, scoreText, text_color=scoreColor, text_size=size.small)
+    // Row 2 - action read, beside the state: what to do now (entry / hold / trim / sell)
+    string actionText = not contractLive ? "--" : f_action_text(lifecycle, callCode)
+    color actionColor = not contractLive ? color.white : (lifecycle == STATE_ARMED or lifecycle == STATE_TRIGGERED or callCode == 4 or callCode == 2) ? color.rgb(76, 220, 145) : (lifecycle == STATE_T1 or lifecycle == STATE_TARGET_2 or lifecycle == STATE_TIME_EXIT) ? color.rgb(243, 178, 69) : (lifecycle == STATE_STOPPED or lifecycle == STATE_INVALIDATED or lifecycle == STATE_EXPIRED or callCode == 5 or callCode == 3) ? color.rgb(255, 112, 128) : color.white
+    table.cell(hud, 0, 2, "ACTION", text_color=color.silver, text_size=size.tiny)
+    table.cell(hud, 1, 2, actionText, text_color=actionColor, text_size=size.tiny)
+    // Row 3 - the timeframe ladder this pane actually scores, slowest first.
+    table.cell(hud, 0, 3, "TREND", text_color=color.silver, text_size=size.tiny)
+    table.cell(hud, 1, 3, contractLive ? f_ladder_text(rung3Direction, rung3Fresh, rung1Direction, rung1Fresh, rung30Direction, rung30Fresh, scoreReady) : "--", text_color=color.white, text_size=size.tiny)
+    // Row 4 - relative volume, from this pane's own bars so it matches the dots
+    table.cell(hud, 0, 4, "RELATIVE VOLUME", text_color=color.silver, text_size=size.tiny)
+    bool showFrozenRvol = (setupStage >= 1 or planId != 0) and not na(breakoutRelativeVolume)
+    float displayedRvol = showFrozenRvol ? breakoutRelativeVolume : rvolRatio
+    string rvolText = not contractLive ? "--" : showFrozenRvol ? str.tostring(displayedRvol, "#.##") + "x at breakout" : na(displayedRvol) ? "Building baseline" : str.tostring(displayedRvol, "#.##") + "x current"
+    table.cell(hud, 1, 4, rvolText, text_color=not na(displayedRvol) and displayedRvol >= RVOL_FLOOR ? color.rgb(76, 220, 145) : color.white, text_size=size.tiny)
+    // Row 5 - mechanical APB-1 setup progress. This is the one row that still
+    // comes from the 30s engine, and it is honest about being a live-only read.
+    bool engineReady = not na(engineAsOf)
+    // v61: SETUP row removed -- it reported a permanent 'NO TRADE | FIRST BREAK FAILED' after the day's first failed break.
+    // v61: SETUP row removed -- it reported a permanent 'NO TRADE | FIRST BREAK FAILED' after the day's first failed break.
+    // Row 6 - data freshness, taken from this pane's own last bar
+    table.cell(hud, 0, 6, "AS OF", text_color=color.silver, text_size=size.tiny)
+    table.cell(hud, 1, 6, na(scoreAsOf) ? "--" : str.format_time(scoreAsOf, "HH:mm:ss", TZ) + " ET", text_color=color.white, text_size=size.tiny)
+    // Row 7 - what is actually driving the score on this pane, plus an honest note
+    // whenever a study is switched on but has not been pointed at a plot yet.
+    string wiringWarning = (useMyBoom and not boomIsWired ? "BOOM: pick a plot  " : "") + (useMySupertrend and not mySupertrendIsWired ? "ST: pick a plot  " : "") + (useMyDmi and not myDmiIsWired ? "DMI: pick a plot  " : "") + (not rung3Fresh ? "3m: no data  " : "") + (not rung1Fresh ? "1m: no data  " : "") + (not rung30Fresh ? "30s: no data  " : "") + (q30Relayed ? "30s via 1m  " : "") + (native30 and not chart.is_standard ? "30s: HA candles  " : "") + (vwapUsedChartPrices ? "VWAP: chart prices  " : "") + (peersReporting < 3 ? "BREADTH: no data  " : "")
+    string driversCore = "ST" + f_vote_mark(ownStDirection < 0 ? 1 : 0, ownStDirection > 0 ? 1 : 0) + " DMI" + f_vote_mark(not na(ownAdx) and ownAdx >= adxTrendFloor and ownDiPlus > ownDiMinus ? 1 : 0, not na(ownAdx) and ownAdx >= adxTrendFloor and ownDiMinus > ownDiPlus ? 1 : 0) + " " + (useMyBoom and boomIsWired ? "BOOM" : "MOM") + f_vote_mark(ownOscRank >= 60 ? 1 : 0, ownOscRank <= 40 ? 1 : 0) + " STR" + f_vote_mark(ownBrokeUp ? 1 : 0, ownBrokeDown ? 1 : 0) + " VOL" + (not na(rvolRatio) and rvolRatio >= scoreRvolFloor ? "▲" : "·") + (fastOpposesContext and scalpEdge > 0 ? "  SCALP " + (fastDirection == 1 ? "▲" : "▼") : "") + (overExtendedUp or overExtendedDown ? "  EXTENDED" : "") + (ownExhLong or ownExhShort ? "  EXH" : "")
+    // Warnings sit ALONGSIDE the family markers, never instead of them. They used
+    // to replace the whole row, which meant one unresolved breadth request hid ST,
+    // DMI, MOM, STRUCT and VOL completely.
+    string driversText = not contractLive ? "--" : driversCore
+    if showDrivers
+        table.cell(hud, 0, 7, "DRIVERS", text_color=color.silver, text_size=size.tiny)
+        table.cell(hud, 1, 7, driversText, text_color=color.silver, text_size=size.tiny)
+    // Row 8 - warnings live on their own line. Appending them to the drivers row made
+    // one very long cell that stretched the whole table far wider than it needed.
+    if str.length(wiringWarning) > 0
+        table.cell(hud, 0, 8, "NOTE", text_color=color.silver, text_size=size.tiny)
+        table.cell(hud, 1, 8, str.trim(wiringWarning), text_color=color.rgb(243, 178, 69), text_size=size.tiny)
