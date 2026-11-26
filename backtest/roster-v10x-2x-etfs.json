@@ -1,0 +1,14 @@
+{
+    "_source":  "Verified 2026-09-29 from issuer live pages: graniteshares.com/etfs/leveraged, tradretfs.com, rexshares T-REX list (Aug 2026), direxion.com product pages (PALU, ORCU, AVL). 63 single-stock leveraged ETFs closed in the year to Aug 2026, so only live funds count.",
+    "AVGO":  "AVGU (GraniteShares), AVL (Direxion)",
+    "DELL":  "DLLL (GraniteShares)",
+    "NTAP":  "NTAL (GraniteShares)",
+    "CIEN":  "CIEX (Tradr)",
+    "CRDO":  "CRDU (Tradr)",
+    "MDB":  "MDBX (Tradr)",
+    "PATH":  "PATX (Tradr)",
+    "GME":  "GMEU (T-REX)",
+    "SNOW":  "SNOU (T-REX)",
+    "PANW":  "PALU (Direxion)",
+    "ORCL":  "ORCU (Direxion)"
+}
