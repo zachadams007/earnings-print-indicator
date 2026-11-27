@@ -2,6 +2,8 @@
 
 A Pine Script v6 indicator for TradingView. It finds the one-minute candle where the market starts reacting to an earnings release (the print candle), waits for a separate confirmation candle, and then manages a trade plan whose stop steps up in stages and then trails the price. Python tools read the SEC filing behind the move and put the numbers on the chart. A second indicator scores three timeframes for scalping (trades held for seconds to minutes) and comes with a test harness built to try to prove its own signals wrong.
 
+![The indicator on CCL's one-minute chart after its 29 September 2026 release, in bar replay, with trade markers, the trade table and the SEC filing's numbers against consensus](docs/images/ccl-replay.webp)
+
 ![Trade anatomy schematic](docs/images/trade-anatomy.svg)
 
 | Measured in this repository | |
@@ -13,6 +15,19 @@ A Pine Script v6 indicator for TradingView. It finds the one-minute candle where
 | Scalping research package | 7,531 lines of Python in `scalping/src`, 210 tests |
 
 Built by Zachary Adams by directing AI coding agents. Charting and indicator development started in 07/2026 and this indicator in 08/2026.
+
+## Backtest results
+
+Two measured runs on the live chart, each written up as a full report. Positions were priced from the indicator's own markers, with 25% taken off at each of four targets (0.60R, 1.40R, 2.40R and 4.00R) and every fill at the close of its one-minute bar. Returns are per trade, on the capital that trade deployed.
+
+| Report | Build | Window | Trades | Mean per trade | 95% interval on the mean | Win rate |
+|---|---|---|---|---|---|---|
+| [August](https://claude.ai/artifact/FLG2NNmhR26iBwXKiEEmRa) | v10.0 | 11 to 31 August 2026 | 34 across 28 symbols | +1.60% | +0.35% to +2.93% | 61.8% |
+| [September](https://claude.ai/artifact/1pazq181gKbX4ECz177kHE) | v10.2 | 1 to 29 September 2026 | 22 across 18 symbols | +0.83% | -0.79% to +2.63% | 59.1% |
+
+The September run measured only companies that appeared in no earlier sample. Both reports test their headline against alternative fill conventions, dropped outliers and a ceiling set by the best exit each trade offered.
+
+![August backtest report](docs/images/backtest-august.webp)
 
 ## Signal path
 
@@ -64,6 +79,10 @@ Once T3 is reached, the stop also follows 2R behind the best price.
 
 Pine cannot make HTTP requests. [`earnings-now.py`](tools/earnings-now.py) polls SEC EDGAR for an 8-K (the SEC's current-event filing) with Item 2.02 (results of operations), downloads the press release (exhibit EX-99.1), compares headline numbers with analyst consensus estimates from Finnhub when a key is set, and [`tv_push.py`](tools/tv_push.py) writes the result into the indicator's inputs through the Chrome DevTools port of the TradingView desktop app. Those inputs are declared last in the script so that adding them could not shift any saved setting.
 
+### Results keyed to the right company and the right moment
+
+[`earnings_watch.py`](tools/earnings_watch.py) runs two loops that do not block each other. The filing loop polls EDGAR about every 25 seconds and writes finished results. The chart loop runs every 2 seconds and renders the card for the symbol the chart is on, because an earlier build pushed whatever it had just found and put Marvell's numbers on a Palo Alto chart. Each card carries the moment the SEC accepted the filing, so in bar replay it stays hidden until the replay clock reaches that moment. [Replay-clock check, line 2755](pine/earnings_print_detector.pine#L2755). [`build_corpus.py`](tools/build_corpus.py) applies the same rule to the answer keys: it fetches the newest Item 2.02 8-K accepted on or before the key's date, so a company that has reported again is not scored against the wrong quarter.
+
 ### Press releases as adversarial input
 
 [`earnings_read.py`](tools/earnings_read.py) turns a press release into EPS, revenue growth, margins and guidance. Its docstring lists the traps found by running it on real filings: the figure before its label, a neighbouring dollar amount that is not per share, "revenue backlog" read as revenue, and three-column income statements where the second number is last quarter. Every parser returns `None` when unsure. [`score_extraction.py`](tools/score_extraction.py) scores the parser against one of three [answer keys](backtest/) at a time. The keys were read from the filings independently of the parser and hold 106 entries for 104 distinct releases from 90 companies. The scorer separates missed fields from wrong ones, because a blank row is safe and a wrong row is not.
@@ -102,6 +121,8 @@ python tools/earnings-now.py --tickers MRVL --replay 2026-08-27
 
 `tv_push.py` and the chart-reading scripts need `websockets`. The scripts in `scalping/scripts` expect a local SQLite file of bars, which is not published. The three `run_noise_boundary` scripts also append their results to a JSONL ledger. `score_extraction.py` scores against a corpus of press releases that `tools/build_corpus.py` downloads from EDGAR first. The trade files that the `backtest` scripts read are not published.
 
+The package keeps bars, news, candidates and trade records in SQLite through [`store.py`](scalping/src/bot/data/store.py): 13 versioned migrations, 12 data tables and write-ahead logging. [`run_scalp_sweep.py`](scalping/scripts/run_scalp_sweep.py) appends every distinct configuration to an append-only [trial ledger](scalping/src/bot/backtest/trial_ledger.py) before it ranks anything, so a multiple-testing penalty such as the deflated Sharpe ratio counts every trial that was run.
+
 To load an indicator, paste a `.pine` file into TradingView's Pine editor. The earnings indicator expects a one-minute chart with extended hours on.
 
 ## Repository map
@@ -118,4 +139,4 @@ To load an indicator, paste a `.pine` file into TradingView's Pine editor. The e
 
 Charts were driven during development by the third-party [tradingview-mcp](https://github.com/tradesdontlie/tradingview-mcp) server (Model Context Protocol, a tool interface for agents), which lets an agent set symbols, compile Pine and read drawn labels. [`bt_driver.py`](tools/bt_driver.py) and [`tv_push.py`](tools/tv_push.py) use the same DevTools port directly.
 
-Versions were kept as whole files so that any build could be restored with one paste. [`PROVENANCE.md`](PROVENANCE.md) lists the source revisions, exclusions and the meaning of `[n]` in comments.
+Versions were kept as whole files so that any build could be restored with one paste. [`PROVENANCE.md`](PROVENANCE.md) lists the source revisions, exclusions and the meaning of `[n]` in code comments.

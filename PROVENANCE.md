@@ -13,6 +13,7 @@ Files were read from the committed revisions with `git archive`, then passed thr
 
 - `README.md`, `PROVENANCE.md`, `.gitignore`, `.github/workflows/ci.yml`, `scalping/pyproject.toml`
 - `docs/images/trade-anatomy.svg`, a schematic with invented bars
+- `docs/images/backtest-august.webp` and `docs/images/ccl-replay.webp`, screenshots supplied by the author
 
 Everything else is project code, data or project documentation.
 
@@ -26,7 +27,8 @@ Everything else is project code, data or project documentation.
 
 ## Changed
 
-- Performance figures are replaced with `[n]`: win rates, profit factors, expectancies, returns, sample sizes and R results. Counts of test events, signals and symbols in comments are treated the same way. Mechanism parameters such as thresholds and rung levels are unchanged in code. Where a comment or tooltip states an R level in the same passage as results, that R level is masked as well.
+- In code comments and tooltips, performance figures are replaced with `[n]`: win rates, profit factors, expectancies, returns, sample sizes and R results. Counts of test events, signals and symbols in comments are treated the same way. Mechanism parameters such as thresholds and rung levels are unchanged in code. Where a comment or tooltip states an R level in the same passage as results, that R level is masked as well.
+- The README's Backtest results section reports two measured runs that the author chose to publish, with links to the full reports. `docs/images` holds a screenshot of the August report and a bar-replay chart.
 - Home-directory paths, email addresses and the SEC contact string are replaced with environment variables or placeholders.
 - Files moved: `docs/backtest` to `backtest`, milestone files to `pine/history`, and the scalping sources under `scalping`. Docstrings follow the new paths.
 - Quoted remarks and the author's first name are removed from comments, docstrings and tooltips, which shortens the Pine files. Executable lines are unchanged.
